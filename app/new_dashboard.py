@@ -61,6 +61,8 @@ from processor import (  # noqa: E402
     search_issues_by_query,
     standardize_dataframe,
 )
+from config import env_snippet, load_jira_config  # noqa: E402
+from pdf_reporter import PdfFontError, create_pdf_report  # noqa: E402
 from reporter import create_excel_report  # noqa: E402
 from llm_assistant import AssistantUnavailableError, DEFAULT_MODEL, chat_with_local_model  # noqa: E402
 
@@ -889,6 +891,33 @@ def _generate_excel_report(file_bytes: bytes, file_name: str, target_month: str 
     }
 
 
+@st.cache_data(show_spinner="PDF raporu oluşturuluyor...")
+def _generate_pdf_report(file_bytes: bytes, file_name: str, target_month: str | None) -> bytes:
+    """Yazdirmaya/paylasmaya hazir PDF raporunu uretir (bkz. `pdf_reporter`).
+
+    `_generate_excel_report` ile AYNI `process_sprint_report` ciktisindan
+    beslenir - iki rapordaki sayilar bu yuzden her zaman birebir tutarlidir.
+    `@st.cache_data` sayesinde ayni dosya/ay icin tekrar tekrar uretilmez.
+    """
+    suffix = Path(file_name).suffix or ".html"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        upload_path = Path(tmp_dir) / f"upload{suffix}"
+        upload_path.write_bytes(file_bytes)
+        result = process_sprint_report(upload_path, target_month=target_month)
+
+    # Rapor basligindaki proje adi, veride EN COK gecen proje adindan turetilir
+    # (tek projelik bir cekimde zaten tek deger vardir).
+    project_label = None
+    projects = result["data"]["project"].astype(str).str.strip()
+    projects = projects[projects != ""]
+    if not projects.empty:
+        project_label = projects.mode().iloc[0]
+
+    return create_pdf_report(
+        result, target_month=result["target_month"], project_label=project_label
+    )
+
+
 def _selected_rows_to_jira_import_csv_bytes(df: pd.DataFrame) -> bytes:
     """Secili satirlari (`issue_type`/`summary`/`assignee`/`estimate` kolonlu),
     Jira'nin toplu ice aktarim sablonuyla AYNI kolon sirasi/basliklariyla bir
@@ -994,12 +1023,72 @@ def _render_jira_live_connect_ui() -> tuple[bytes | None, str | None]:
     Token, diske yazilmaz/loglanmaz - sadece bu oturumun `st.session_state`'inde
     tutulur; hata mesajlarinda asla gosterilmez.
     """
+    cfg = load_jira_config()
+
+    # --- Hizli yol: .env tam doluysa hicbir sey sorma, tek tikla (veya
+    # JIRA_AUTO_CONNECT=true ise hic tiklatmadan) tam veriyi cek. Kesif adimi,
+    # SADECE alan eslestirmesi bilinmedigi icin vardir - `.env` onu zaten
+    # veriyorsa atlanmasi gerekir.
+    if cfg.can_fetch_directly and not st.session_state.get("_jira_env_override"):
+        st.success(f"`.env`'den yüklendi: **{cfg.project_key}** · son {cfg.months_back} ay")
+        should_fetch = st.button("🔄 Jira'dan Verileri Çek", type="primary", key="jira_env_fetch_btn")
+        # Otomatik cekim oturumda YALNIZCA BIR KEZ - aksi halde her yeniden
+        # calistirmada (her filtre degisiminde) Jira'ya yeni istek giderdi.
+        if cfg.auto_connect and not st.session_state.get("_jira_autofetch_done"):
+            st.session_state["_jira_autofetch_done"] = True
+            should_fetch = True
+
+        if should_fetch:
+            with st.spinner("Jira'dan veriler çekiliyor..."):
+                try:
+                    full_df = _call_jira_api_with_ssl_retry(
+                        fetch_issues_from_jira_api,
+                        cfg.base_url,
+                        cfg.token,
+                        cfg.project_key,
+                        cfg.field_id_map,
+                        months_back=cfg.months_back,
+                        skip_ssl=cfg.skip_ssl,
+                    )
+                except JiraApiError as exc:
+                    st.error(str(exc))
+                else:
+                    if full_df.empty:
+                        st.warning(f"Son {cfg.months_back} ay içinde hiç kart bulunamadı.")
+                    else:
+                        st.session_state["_jira_fetched_bytes"] = full_df.to_csv(index=False).encode("utf-8-sig")
+                        st.session_state["_jira_fetched_name"] = "jira_canli_veri.csv"
+                        st.success(f"{len(full_df):,} kart Jira'dan çekildi.")
+
+        if st.button("⚙️ Ayarları elle değiştir", key="jira_env_override_btn"):
+            st.session_state["_jira_env_override"] = True
+            st.rerun()
+
+        return st.session_state.get("_jira_fetched_bytes"), st.session_state.get("_jira_fetched_name")
+
+    # --- Normal yol: alanlari `.env`'deki degerlerle ON DOLDUR, eksikleri sor.
+    if cfg.has_credentials:
+        st.caption("Alanlar `.env` dosyasından dolduruldu; gerekirse değiştirebilirsiniz.")
+
     with st.form("jira_connect_form"):
-        base_url = st.text_input("Jira URL", value="https://jira.turkcell.com.tr")
-        token = st.text_input("Personal Access Token", type="password")
-        project_key = st.text_input("Proje Anahtarı (Project Key)")
-        months_back = st.number_input("Kaç ay geriye gidilsin", min_value=1, max_value=36, value=6, step=1)
-        skip_ssl = st.checkbox("SSL doğrulamayı atla (yalnızca kurumsal ağda güvenliyse)", value=False)
+        base_url = st.text_input("Jira URL", value=cfg.base_url)
+        token = st.text_input(
+            "Personal Access Token",
+            type="password",
+            value=cfg.token,
+            help="`.env` içindeki JIRA_PAT alanına yazarsanız her açılışta sorulmaz.",
+        )
+        project_key = st.text_input(
+            "Proje Anahtarı (Project Key)",
+            value=cfg.project_key,
+            help="Anahtar (örn. MS) veya sayısal proje ID'si (örn. 31031) girebilirsiniz.",
+        )
+        months_back = st.number_input(
+            "Kaç ay geriye gidilsin", min_value=1, max_value=36, value=cfg.months_back, step=1
+        )
+        skip_ssl = st.checkbox(
+            "SSL doğrulamayı atla (yalnızca kurumsal ağda güvenliyse)", value=cfg.skip_ssl
+        )
         discover_clicked = st.form_submit_button("Bağlan ve Keşfet")
 
     if discover_clicked:
@@ -1059,6 +1148,20 @@ def _render_jira_live_connect_ui() -> tuple[bytes | None, str | None]:
         if sample_issues:
             st.caption(f"Örnek önizleme ({len(sample_issues)} kart):")
             st.dataframe(_jira_sample_preview_df(sample_issues, field_id_map), width="stretch", hide_index=True)
+
+        # Bulunan alan ID'leri (`customfield_XXXXX`) her Jira kurulumunda farklidir
+        # ve elle bulunmasi zahmetlidir. Kesif onlari zaten cozdugu icin, sonucu
+        # `.env`'e yapistirilabilir halde sunmak keşif adimini KALICI olarak
+        # atlatir - bir dahaki acilista dogrudan veri cekilir.
+        with st.expander("💾 Bu ayarları kalıcı yap (.env)"):
+            st.caption(
+                "Aşağıdakini proje kökündeki `.env` dosyasına yapıştırın - bir dahaki "
+                "açılışta bu adım tamamen atlanır ve veri tek tıkla gelir."
+            )
+            st.code(
+                env_snippet(connect_params["base_url"], connect_params["project_key"], field_id_map),
+                language="bash",
+            )
 
         if st.button("Onayla ve Tam Veriyi Çek", type="primary", key="jira_fetch_all_btn"):
             try:
@@ -2119,24 +2222,60 @@ elif page == NAV_PAGES[5]:
         "iş listeleri)."
     )
 
-    if st.button("Excel Raporu Oluştur", type="primary"):
-        rapor = _generate_excel_report(file_bytes, file_name, selected_month)
-        st.session_state["excel_bytes"] = rapor["excel_bytes"]
-        st.session_state["excel_planned_df"] = rapor["planned_preview_df"]
-        st.session_state["excel_out_of_plan_df"] = rapor["out_of_plan_preview_df"]
-        st.session_state["excel_planned_export_df"] = rapor["planned_export_df"]
-        st.session_state["excel_out_of_plan_export_df"] = rapor["out_of_plan_export_df"]
-        dosya_ay = (selected_month or "tum_aylar").replace(" ", "_")
-        st.session_state["excel_filename"] = f"sprint_raporu_{dosya_ay}.xlsx"
-        st.success("Excel raporu hazır.")
+    dosya_ay = (selected_month or "tum_aylar").replace(" ", "_")
+    excel_col, pdf_col = st.columns(2)
+
+    with excel_col:
+        if st.button("📊 Excel Raporu Oluştur", type="primary", width="stretch"):
+            rapor = _generate_excel_report(file_bytes, file_name, selected_month)
+            st.session_state["excel_bytes"] = rapor["excel_bytes"]
+            st.session_state["excel_planned_df"] = rapor["planned_preview_df"]
+            st.session_state["excel_out_of_plan_df"] = rapor["out_of_plan_preview_df"]
+            st.session_state["excel_planned_export_df"] = rapor["planned_export_df"]
+            st.session_state["excel_out_of_plan_export_df"] = rapor["out_of_plan_export_df"]
+            st.session_state["excel_filename"] = f"sprint_raporu_{dosya_ay}.xlsx"
+            st.success("Excel raporu hazır.")
+
+    with pdf_col:
+        if st.button("📄 PDF Raporu Oluştur", width="stretch"):
+            try:
+                st.session_state["pdf_bytes"] = _generate_pdf_report(
+                    file_bytes, file_name, selected_month
+                )
+            except PdfFontError as exc:
+                # Turkce karakterli font yoksa BOZUK bir PDF uretmek yerine
+                # durum acikca bildirilir (bkz. pdf_reporter modul dokumantasyonu).
+                st.session_state.pop("pdf_bytes", None)
+                st.error(str(exc))
+            else:
+                st.session_state["pdf_filename"] = f"sprint_raporu_{dosya_ay}.pdf"
+                st.success("PDF raporu hazır.")
+
+    excel_dl_col, pdf_dl_col = st.columns(2)
+    with excel_dl_col:
+        if "excel_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Excel Raporunu İndir",
+                data=st.session_state["excel_bytes"],
+                file_name=st.session_state["excel_filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+            )
+    with pdf_dl_col:
+        if "pdf_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ PDF Raporunu İndir",
+                data=st.session_state["pdf_bytes"],
+                file_name=st.session_state["pdf_filename"],
+                mime="application/pdf",
+                width="stretch",
+            )
+            st.caption(
+                f"{len(st.session_state['pdf_bytes']) / 1024:,.0f} KB · KPI özeti, trend "
+                "grafiği, statü/kişi dağılımı ve iş listeleri"
+            )
 
     if "excel_bytes" in st.session_state:
-        st.download_button(
-            "Excel Raporunu İndir",
-            data=st.session_state["excel_bytes"],
-            file_name=st.session_state["excel_filename"],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
 
         st.caption(
             "Excel içeriğinin önizlemesi - Excel'deki gibi planlanan/plan dışı AYRI iki tablo "

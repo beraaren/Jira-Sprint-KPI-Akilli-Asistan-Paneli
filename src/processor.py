@@ -258,6 +258,13 @@ JIRA_API_SEARCH_ENDPOINT = "rest/api/2/search"
 JIRA_DISCOVERY_SAMPLE_SIZE = 5
 JIRA_FETCH_PAGE_SIZE = 100
 
+# Kesif sirasinda alan adaylarini SIRALAMAK icin bakilan kart sayisi. Onizlemede
+# gosterilen `JIRA_DISCOVERY_SAMPLE_SIZE` karttan daha buyuktur: 5 kart, bir
+# alanin o projede gercekten kullanilip kullanilmadigini anlamak icin yetersiz
+# kalabilir (orn. %54 dolulukta bir alan 5 kartin hepsinde bos cikabilir).
+# Tek bir istekte cekilir - ek maliyeti yoktur.
+JIRA_RANKING_SAMPLE_SIZE = 25
+
 # Story Points/Developer/Analist ozel alanlarini Jira'nin `/field` listesinden
 # TEK bir Ingilizce kelimeye gore degil, birden fazla (kucuk/buyuk harf duyarsiz,
 # alt string) varyanta gore ARAR - boylece Turkce/Ingilizce karisik alan adi
@@ -270,6 +277,88 @@ JIRA_FIELD_CANDIDATE_VARIANTS: dict[str, list[str]] = {
     "developer": ["developer", "geliştirici", "gelistirici"],
     "analyst": ["analist", "analyst", "analiz"],
 }
+
+# Buyuk kurumsal Jira kurulumlarinda BINLERCE ozel alan bulunur; duz alt-string
+# eslesmesi tek basina ise yaramaz. Ornegin "sp" varyanti "Sponsordan Kalite
+# Notu", "Sprint", "UAT Spoc" gibi onlarca alakasiz alana takilir ve gercek
+# "Story Points" alani listenin cok gerisine duser. Bu yuzden adaylar SIRALANIR
+# (bkz. _rank_field_candidates) ve arayuz/varsayilan secim en ustteki adayi alir.
+#
+# Bu tam-adlar en yuksek onceligi alir - bir alanin adi TAM olarak bunlardan
+# biriyse, o alan neredeyse kesinlikle aranan alandir.
+JIRA_FIELD_EXACT_NAMES: dict[str, list[str]] = {
+    "story_points": ["story points", "story point", "puan"],
+    "developer": ["developers", "developer"],
+    "analyst": ["analists", "analists", "analyst", "analysts", "analist"],
+}
+
+# Bu uzunluktan kisa varyantlar SADECE kelime siniri ile eslesir, alt-string
+# olarak degil - "sp"nin "Sponsordan"a takilmasini engelleyen kural budur.
+_SHORT_VARIANT_MAX_LEN = 3
+
+
+def _count_filled(issues: list[dict], field_id: str) -> int:
+    """Ornek kartlarin kacinda bu alanin DOLU oldugunu sayar."""
+    count = 0
+    for issue in issues:
+        value = (issue.get("fields") or {}).get(field_id)
+        if value not in (None, "", [], {}):
+            count += 1
+    return count
+
+
+def _rank_field_candidates(target: str, matches: list[dict], sample_issues: list[dict]) -> list[dict]:
+    """Alan adaylarini "en olasi once" sirasina dizer.
+
+    Iki olcut BIRLIKTE kullanilir, cunku tek basina ikisi de yaniltir:
+
+    - Sadece ADA bakmak: MS projesinde hem "Developer" (customfield_10322) hem
+      "Developers" (customfield_13483) vardir; adlari neredeyse aynidir ama
+      yalnizca ikincisi doludur. Ad, ikisini ayirt edemez.
+    - Sadece DOLULUGA bakmak: "Analiz Dokümanı Uyarı" alani her kartta dolu
+      oldugu icin, asil aradigimiz "Analists" alanini geride birakir. Doluluk,
+      alakasiz ama her zaman dolu alanlari one cikarir.
+
+    Bu yuzden once ad guveni (tier), sonra doluluk uygulanir. Ek olarak, ornek
+    kartlarin HICBIRINDE dolu olmayan bir alan - adi ne kadar uygun olursa olsun -
+    iki kademe geri atilir: o projede kullanilmayan bir alani secmek her zaman
+    yanlistir. Boylece bos "Analist" alani, dolu "Analists" alanina yenilir ama
+    yine de alakasiz alanlarin onunde kalir.
+
+    Esitlik halinde daha KISA ad once gelir - "Story Points", "Original story
+    points"ten once cikar."""
+    exact = JIRA_FIELD_EXACT_NAMES.get(target, [])
+    variants = JIRA_FIELD_CANDIDATE_VARIANTS.get(target, [])
+
+    def sort_key(field: dict) -> tuple[int, int, int, str]:
+        name = _normalize_header(field.get("name", ""))
+        if name in exact:
+            tier = 0
+        elif any(re.search(rf"\b{re.escape(v)}\b", name) for v in variants):
+            tier = 1
+        else:
+            tier = 2
+        filled = _count_filled(sample_issues, field.get("id", ""))
+        if filled == 0 and sample_issues:
+            tier += 2
+        # Doluluk NEGATIF sirada - cok dolu olan basa gelsin.
+        return (tier, -filled, len(name), name)
+
+    return sorted(matches, key=sort_key)
+
+
+def _field_matches_variant(field_name: str, variants: list[str]) -> bool:
+    """Bir alan adinin verilen varyantlardan biriyle eslesip eslesmedigi. Kisa
+    varyantlar (bkz. `_SHORT_VARIANT_MAX_LEN`) yanlis pozitif uretmemesi icin
+    yalnizca kelime siniriyla aranir."""
+    name = _normalize_header(field_name)
+    for variant in variants:
+        if len(variant) <= _SHORT_VARIANT_MAX_LEN:
+            if re.search(rf"\b{re.escape(variant)}\b", name):
+                return True
+        elif variant in name:
+            return True
+    return False
 
 # fetch_issues_from_jira_api'nin `field_id_map`'inde beklenen anahtarlar (bkz.
 # JIRA_FIELD_CANDIDATE_VARIANTS'in anahtarlariyla AYNI).
@@ -294,21 +383,54 @@ def _jira_auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
+def _jira_error_detail(response: requests.Response) -> str:
+    """Jira'nin hata yanitindaki `errorMessages`/`errors` alanlarini tek satirlik
+    bir metne cevirir (yoksa bos string doner). Jira, ozellikle 400'lerde sorunun
+    ne oldugunu ("The value 'MS' does not exist for the field 'project'." gibi)
+    TAM olarak soyler - bu detayi yutmak yerine kullaniciya gostermek, yanlis
+    yone sevk eden genel tahmin metinlerinden ("proje anahtari hatali olabilir")
+    cok daha kullanislidir."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    parts = [str(m) for m in payload.get("errorMessages", []) if m]
+    errors = payload.get("errors")
+    if isinstance(errors, dict):
+        parts.extend(f"{k}: {v}" for k, v in errors.items())
+    return " ".join(parts).strip()
+
+
 def _raise_for_jira_status(response: requests.Response, project_key: str) -> None:
     """HTTP durum koduna gore SPESIFIK bir `JiraApiError` firlatir (401/403/400);
     diger "basarisiz" durum kodlari icin `requests`'in kendi genel HTTPError'una
-    duser. Basarili (2xx) yanitlarda hicbir sey yapmaz."""
+    duser. Basarili (2xx) yanitlarda hicbir sey yapmaz.
+
+    Her durumda, varsa Jira'nin KENDI hata mesaji da eklenir (bkz.
+    `_jira_error_detail`) - sunucunun soyledigi somut sebep, bizim tahminimizden
+    once gelir."""
+    if response.status_code not in (400, 401, 403):
+        response.raise_for_status()
+        return
+
+    detail = _jira_error_detail(response)
+    suffix = f" Jira'nın yanıtı: {detail}" if detail else ""
+
     if response.status_code == 401:
         raise JiraApiError(
-            "Token geçersiz veya süresi dolmuş. Jira profilinden yeni bir Personal Access Token oluşturun."
+            "Token geçersiz veya süresi dolmuş. Jira profilinden yeni bir Personal "
+            f"Access Token oluşturun.{suffix}"
         )
     if response.status_code == 403:
-        raise JiraApiError(f"Bu token'ın '{project_key}' projesine erişim yetkisi yok.")
-    if response.status_code == 400:
-        raise JiraApiError(
-            f"Proje anahtarı '{project_key}' hatalı olabilir. Jira'da proje anahtarını kontrol edin."
-        )
-    response.raise_for_status()
+        raise JiraApiError(f"Bu token'ın '{project_key}' projesine erişim yetkisi yok.{suffix}")
+    raise JiraApiError(
+        f"Sorgu Jira tarafından reddedildi (400). Proje anahtarı '{project_key}' hatalı "
+        "olabilir ya da token'ın bu projeyi görme (Browse Projects) yetkisi yoktur - Jira, "
+        "var olmayan projeyle görme yetkisi olmayan projeyi aynı şekilde raporlar. "
+        f"Proje anahtarı yerine sayısal proje ID'sini de girebilirsiniz.{suffix}"
+    )
 
 
 def _jira_get(
@@ -331,6 +453,18 @@ def _jira_get(
         ) from exc
     _raise_for_jira_status(response, project_key)
     return response
+
+
+def _jql_project_term(project_key: str) -> str:
+    """JQL'in `project = ...` terimini uretir. Deger TAMAMEN RAKAMSA tirnaksiz
+    birakilir - Jira bu durumda onu sayisal proje ID'si olarak cozer; tirnak
+    icine alinsaydi ("10500") bir proje ANAHTARI/ADI sanilip bulunamazdi.
+    Anahtarin kendisi calismadiginda (orn. ayni ada sahip birden fazla proje
+    veya alisilmadik anahtar) ID ile baglanabilmek icin bir kacis yoludur."""
+    value = project_key.strip()
+    if value.isdigit():
+        return f"project = {value}"
+    return f'project = "{value}"'
 
 
 def jira_person_field_to_display(value: object) -> str:
@@ -390,22 +524,36 @@ def discover_jira_fields(base_url: str, token: str, project_key: str, verify: bo
     fields_response = _jira_get(f"{base_url}/{JIRA_API_FIELD_ENDPOINT}", headers, None, project_key, verify)
     all_fields = fields_response.json()
 
-    candidates: dict[str, list[dict]] = {}
-    for target, variants in JIRA_FIELD_CANDIDATE_VARIANTS.items():
-        candidates[target] = [
-            {"id": f.get("id"), "name": f.get("name")}
-            for f in all_fields
-            if any(variant in _normalize_header(f.get("name", "")) for variant in variants)
-        ]
-
+    # Ornek kartlar adaylardan ONCE cekilir: siralama, alan ADINA degil bu
+    # kartlardaki DOLULUGA bakar (bkz. _rank_field_candidates). `fields=*all`
+    # sart - varsayilan yanit tum ozel alanlari icermeyebilir ve o zaman her
+    # aday "bos" gorunup siralama ada geri duserdi.
     search_response = _jira_get(
         f"{base_url}/{JIRA_API_SEARCH_ENDPOINT}",
         headers,
-        {"jql": f'project = "{project_key}" ORDER BY created DESC', "maxResults": JIRA_DISCOVERY_SAMPLE_SIZE},
+        {
+            "jql": f"{_jql_project_term(project_key)} ORDER BY created DESC",
+            "maxResults": JIRA_RANKING_SAMPLE_SIZE,
+            "fields": "*all",
+        },
         project_key,
         verify,
     )
-    sample_issues = search_response.json().get("issues", [])
+    ranking_issues = search_response.json().get("issues", [])
+
+    candidates: dict[str, list[dict]] = {}
+    for target, variants in JIRA_FIELD_CANDIDATE_VARIANTS.items():
+        matches = [
+            {"id": f.get("id"), "name": f.get("name")}
+            for f in all_fields
+            if _field_matches_variant(f.get("name", ""), variants)
+        ]
+        # "En olasi once" - arayuz varsayilan olarak candidates[0]'i secer.
+        candidates[target] = _rank_field_candidates(target, matches, ranking_issues)
+
+    # Onizleme tablosu icin daha kucuk bir dilim - siralama icin 25 karta
+    # bakariz ama kullaniciya 5 kart gostermek yeterlidir.
+    sample_issues = ranking_issues[:JIRA_DISCOVERY_SAMPLE_SIZE]
 
     return {"all_fields": all_fields, "candidates": candidates, "sample_issues": sample_issues}
 
@@ -474,7 +622,7 @@ def fetch_issues_from_jira_api(
     headers = _jira_auth_headers(token)
 
     start_date = (pd.Timestamp.now().normalize() - pd.DateOffset(months=months_back)).strftime("%Y-%m-%d")
-    jql = f'project = "{project_key}" AND created >= "{start_date}" ORDER BY created ASC'
+    jql = f'{_jql_project_term(project_key)} AND created >= "{start_date}" ORDER BY created ASC'
 
     story_points_id = field_id_map.get("story_points")
     developer_id = field_id_map.get("developer")

@@ -6,3 +6,8 @@ streamlit>=1.44.0
 plotly==5.22.0
 ollama==0.6.2
 requests==2.32.2
+python-dotenv==1.2.3
+# PDF raporu (bkz. src/pdf_reporter.py). kaleido, plotly grafiklerini PDF'e
+# gomulecek PNG'ye cevirir - plotly 5.x ile UYUMLU surum 0.2.1'dir.
+reportlab==5.0.1
+kaleido==0.2.1
