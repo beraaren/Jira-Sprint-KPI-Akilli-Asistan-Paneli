@@ -69,7 +69,6 @@ if not exist ".venv" (
 
 REM 4) Ortami aktive et ve bagimliliklari kur
 echo.
-echo Bagimliliklar kuruluyor (pip install -r requirements.txt)...
 call .venv\Scripts\activate.bat
 if errorlevel 1 (
     echo.
@@ -77,10 +76,16 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+echo Pip guncelleniyor...
+python -m pip install --upgrade pip
+echo Bagimliliklar kuruluyor (pip install -r requirements.txt)...
 pip install -r requirements.txt
 if errorlevel 1 (
     echo.
     echo [HATA] Bagimliliklar kurulamadi. Yukaridaki hata mesajina bakin.
+    echo Bu genellikle internet baglantisi sorunu veya cok eski/cok yeni bir Python
+    echo surumunden kaynaklanir. Python surumunuzu guncel bir surumle ^(python.org^)
+    echo degistirmeyi deneyin.
     pause
     exit /b 1
 )
