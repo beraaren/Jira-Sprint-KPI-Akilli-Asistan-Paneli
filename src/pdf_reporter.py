@@ -342,14 +342,19 @@ def create_pdf_report(
     """`process_sprint_report` ciktisini tek bir PDF'e yazar ve BYTE olarak doner
     (diske yazmaz - Streamlit'in `st.download_button`'ina dogrudan verilebilir).
 
-    Rapor bolumleri:
+    Rapor bolumleri, iterasyon kapanis e-postasinin formatini BIREBIR takip eder
+    (bkz. `reporter.create_excel_report` - Excel ile AYNI bolumler, AYNI sirada):
         1) Baslik + kapsam (ay, proje, olusturma zamani)
         2) 6 KPI kutusu (taahhut/gerceklesen/plan disi/toplam SP, tamamlanma ve
-           plan disi oranlari)
-        3) Aylik trend grafigi (varsa) + ayni verinin tablosu
-        4) Statu dagilimi ve kisi bazli yuk tablolari
-        5) Planlanan is listesi
-        6) Plan disi is listesi
+           plan disi oranlari) - hedef aya ait ozet
+        3) "İterasyon Bazlı İş Büyüklüğü (SP)": Taahhüt Edilen/Gerçekleşen/
+           Plan Dışı/Toplam grafigi + ayni verinin tablosu
+        4) "<ay> iterasyonunda planlanan iş listemiz ve statüleri" (6 kolon)
+        5) "<ay> iterasyonunda plan dışı iş listemiz ve statüleri" (4 kolon)
+
+    Rapor formati e-postada sayilan bu bolumlerle SINIRLIDIR; statu dagilimi ve
+    kisi bazli yuk gibi ek analizler KASITLI olarak bu rapora girmez (panelde
+    kendi sayfalarinda incelenir).
 
     `processed_data`, `reporter.create_excel_report` ile AYNI sozluktur (`data`,
     `planned_issues`, `out_of_plan_issues`, `summary`, `monthly_history`,
@@ -372,7 +377,11 @@ def create_pdf_report(
     story: list = []
 
     # 1) Baslik
-    story.append(Paragraph("Sprint &amp; KPI Raporu", styles["title"]))
+    # Baslik, iterasyon kapanis e-postasinin basligiyla ayni kaliptadir:
+    # "<Proje> - <Ay> İterasyon Kapanış Sonuçları".
+    baslik_parcalari = [p for p in (project_label, label) if p]
+    baslik = " - ".join(baslik_parcalari) + " İterasyon Kapanış Sonuçları" if baslik_parcalari else "İterasyon Kapanış Sonuçları"
+    story.append(Paragraph(baslik.replace("&", "&amp;"), styles["title"]))
     kapsam = [f"Kapsam: {label}" if label else "Kapsam: Tüm Aylar"]
     if project_label:
         kapsam.insert(0, f"Proje: {project_label}")
@@ -396,27 +405,13 @@ def create_pdf_report(
     story.extend(_dataframe_table(history_df, styles))
     story.append(Spacer(1, 14))
 
-    # 4) Statu dagilimi + kisi bazli yuk
-    status_df = pd.DataFrame(summary.get("status_breakdown", []))
-    assignee_df = pd.DataFrame(summary.get("assignee_metrics", []))
-
-    story.append(PageBreak())
-    story.append(_section_title("Statü Dağılımı", styles))
-    story.append(Spacer(1, 6))
-    story.extend(_dataframe_table(status_df, styles))
-    story.append(Spacer(1, 14))
-
-    story.append(_section_title("Kişi Bazlı İş Yükü", styles))
-    story.append(Spacer(1, 6))
-    story.extend(_dataframe_table(assignee_df, styles))
-
-    # 5-6) Is listeleri
+    # 4-5) Is listeleri
     prefix = f"{label} iterasyonunda " if label else ""
     planned_title = (
-        f"{prefix}planlanan iş listemiz ve statüleri" if prefix else "Planlanan iş listemiz ve statüleri"
+        f"{prefix}planlanan iş listemiz ve statüleri:" if prefix else "Planlanan iş listemiz ve statüleri:"
     )
     out_of_plan_title = (
-        f"{prefix}plan dışı iş listemiz ve statüleri" if prefix else "Plan dışı iş listemiz ve statüleri"
+        f"{prefix}plan dışı iş listemiz ve statüleri:" if prefix else "Plan dışı iş listemiz ve statüleri:"
     )
 
     story.append(PageBreak())

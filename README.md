@@ -40,7 +40,11 @@ dönüştürülür.
 
 - **Temel Sprint KPI'ları** - Taahhüt edilen / gerçekleşen / plan dışı SP,
   tamamlanma oranı, plan dışı oranı.
-- **Aylık trend karşılaştırması** - `created` tarihine göre ay ay KPI kıyaslaması.
+- **Aylık trend karşılaştırması** - ay ay KPI kıyaslaması. Bir kartın hangi aya
+  ait sayıldığı Jira'nın **Sprint** alanından belirlenir ("ilgili sprinte ait
+  kartlar"); böylece devreden bir kart, açıldığı ayda değil yer aldığı her
+  sprintin ayında sayılır. Sprint alanı boş olan ya da adından ay çıkarılamayan
+  kartlarda (`Sprint 2`, `MS Sprint 3` gibi) `created` tarihine düşülür.
 - **5 Temel KPI paketi** - Velocity & Predictability, Scope Stability, Workload
   Equity/Consistency, Flow Efficiency & Bottlenecks, Estimation Accuracy &
   Variance; takım/kişi/proje bazında.

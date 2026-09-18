@@ -41,12 +41,13 @@ FAKE_FIELDS = [
     {"id": "customfield_10031", "name": "Geliştirici Ekibi"},
     {"id": "customfield_10040", "name": "Analists"},
     {"id": "customfield_10041", "name": "Business Analyst"},
+    {"id": "customfield_10050", "name": "Sprint"},
     {"id": "summary", "name": "Summary"},
     {"id": "customfield_99999", "name": "Renk Kodu"},  # hicbir varyantla eslesmemeli
 ]
 
 
-def _make_response(status_code: int, json_data: dict | None = None) -> MagicMock:
+def _make_response(status_code: int, json_data: dict | list | None = None) -> MagicMock:
     response = MagicMock(spec=requests.Response)
     response.status_code = status_code
     response.json.return_value = json_data or {}
@@ -107,6 +108,15 @@ class FetchIssuesFromJiraApiTests(unittest.TestCase):
         "analyst": "customfield_10040",
     }
 
+    # Sprint alani kullaniciya SORULMAZ; `fetch_issues_from_jira_api` adini
+    # `/field` uzerinden kendisi bulur (bkz. processor.find_sprint_field_id).
+    # Bu yuzden her cekim, arama isteklerinden ONCE bir `/field` istegi yapar.
+    def _field_response(self) -> MagicMock:
+        return _make_response(200, FAKE_FIELDS)
+
+    def _search_calls(self, mock_get: MagicMock) -> list:
+        return [c for c in mock_get.call_args_list if c.args[0].endswith("/search")]
+
     def _fake_issue(self, key: str, summary: str, developers: list[str], analysts: list[str]) -> dict:
         return {
             "key": key,
@@ -123,6 +133,7 @@ class FetchIssuesFromJiraApiTests(unittest.TestCase):
                 "customfield_10010": 5,
                 "customfield_10030": [{"displayName": d} for d in developers],
                 "customfield_10040": [{"displayName": a} for a in analysts],
+                "customfield_10050": [{"name": "MS Sprint - Temmuz 26"}],
             },
         }
 
@@ -137,18 +148,22 @@ class FetchIssuesFromJiraApiTests(unittest.TestCase):
         response_page1 = _make_response(200, {"issues": page1_issues, "total": 150})
         response_page2 = _make_response(200, {"issues": page2_issues, "total": 150})
 
-        with patch("processor.requests.get", side_effect=[response_page1, response_page2]) as mock_get:
+        side_effect = [self._field_response(), response_page1, response_page2]
+        with patch("processor.requests.get", side_effect=side_effect) as mock_get:
             df = fetch_issues_from_jira_api(BASE_URL, TOKEN, PROJECT_KEY, self.FIELD_MAP, months_back=6)
 
         self.assertEqual(len(df), 150)
-        self.assertEqual(mock_get.call_count, 2)
-        start_ats = [call.kwargs["params"]["startAt"] for call in mock_get.call_args_list]
+        search_calls = self._search_calls(mock_get)
+        self.assertEqual(len(search_calls), 2)
+        start_ats = [call.kwargs["params"]["startAt"] for call in search_calls]
         self.assertEqual(start_ats, [0, 100])
 
         # Sadece gerekli alanlar istendi mi (performans)?
-        requested = mock_get.call_args_list[0].kwargs["params"]["fields"]
+        requested = search_calls[0].kwargs["params"]["fields"]
         self.assertIn("customfield_10010", requested)
         self.assertIn("summary", requested)
+        # Sprint alani otomatik bulunup istege eklenmis olmali.
+        self.assertIn("customfield_10050", requested)
 
     def test_multi_value_developer_field_and_standardize_dataframe_roundtrip(self):
         """Coklu developer/analist listesi virgulle-ayrilmis TEK hucreye donmeli
@@ -157,11 +172,12 @@ class FetchIssuesFromJiraApiTests(unittest.TestCase):
         issue = self._fake_issue("MS-914", "Test kart", ["Kullanıcı C", "Kullanıcı D"], ["Kullanıcı E"])
         response = _make_response(200, {"issues": [issue], "total": 1})
 
-        with patch("processor.requests.get", side_effect=[response]):
+        with patch("processor.requests.get", side_effect=[self._field_response(), response]):
             raw_df = fetch_issues_from_jira_api(BASE_URL, TOKEN, PROJECT_KEY, self.FIELD_MAP)
 
         self.assertEqual(raw_df.loc[0, "Developers"], "Kullanıcı C, Kullanıcı D")
         self.assertEqual(raw_df.loc[0, "Story Points"], 5)
+        self.assertEqual(raw_df.loc[0, "Sprint"], "MS Sprint - Temmuz 26")
 
         # standardize_dataframe HIC DEGISTIRILMEDEN calismali
         std_df = standardize_dataframe(raw_df)
@@ -169,13 +185,17 @@ class FetchIssuesFromJiraApiTests(unittest.TestCase):
         self.assertEqual(std_df.loc[0, "estimate"], 5.0)
         self.assertEqual(std_df.loc[0, "assignee"], "Kullanıcı A")
         self.assertTrue(pd.notna(std_df.loc[0, "created"]), "ISO 8601 'created' tarihi doğru ayrıştırılmalı")
+        # Sprint, CSV disa aktarimindan gelmis gibi aya cozulmus olmali.
+        self.assertEqual(std_df.loc[0, "sprint"], ["MS Sprint - Temmuz 26"])
+        self.assertEqual(std_df.loc[0, "sprint_months"], ["2026-07"])
 
     def test_zero_results_returns_empty_dataframe_not_error(self):
         response = _make_response(200, {"issues": [], "total": 0})
-        with patch("processor.requests.get", side_effect=[response]):
+        with patch("processor.requests.get", side_effect=[self._field_response(), response]):
             df = fetch_issues_from_jira_api(BASE_URL, TOKEN, PROJECT_KEY, self.FIELD_MAP)
         self.assertTrue(df.empty)
         self.assertIn("Issue Type", df.columns)
+        self.assertIn("Sprint", df.columns)
 
     def test_unmapped_optional_fields_are_blank_not_crash(self):
         """story_points/developer/analyst haritalanmamissa (None) hata firlatmadan
@@ -183,11 +203,27 @@ class FetchIssuesFromJiraApiTests(unittest.TestCase):
         issue = self._fake_issue("MS-1", "Kart", [], [])
         response = _make_response(200, {"issues": [issue], "total": 1})
         empty_map = {"story_points": None, "developer": None, "analyst": None}
-        with patch("processor.requests.get", side_effect=[response]):
+        with patch("processor.requests.get", side_effect=[self._field_response(), response]):
             df = fetch_issues_from_jira_api(BASE_URL, TOKEN, PROJECT_KEY, empty_map)
         self.assertEqual(df.loc[0, "Story Points"], "")
         self.assertEqual(df.loc[0, "Developers"], "")
         standardize_dataframe(df)  # hata firlatmamali
+
+    def test_sprint_field_lookup_failure_does_not_break_fetch(self):
+        """Sprint alani `/field` uzerinden bulunamazsa (orn. istek patlarsa) cekim
+        DUSMEMELI; sadece Sprint kolonu bos kalmali - ay atamasi `created`
+        tarihine duser (bkz. processor._row_month_keys)."""
+        issue = self._fake_issue("MS-2", "Kart", [], [])
+        response = _make_response(200, {"issues": [issue], "total": 1})
+        broken_field_response = _make_response(200, {"beklenmedik": "bicim"})
+
+        with patch("processor.requests.get", side_effect=[broken_field_response, response]):
+            df = fetch_issues_from_jira_api(BASE_URL, TOKEN, PROJECT_KEY, self.FIELD_MAP)
+
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.loc[0, "Sprint"], "")
+        std_df = standardize_dataframe(df)
+        self.assertEqual(std_df.loc[0, "sprint_months"], [])
 
 
 class JiraApiErrorMessageTests(unittest.TestCase):

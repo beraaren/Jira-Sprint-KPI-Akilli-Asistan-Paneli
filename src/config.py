@@ -39,6 +39,13 @@ _FIELD_ENV_KEYS = {
     "story_points": "JIRA_FIELD_STORY_POINTS",
     "developer": "JIRA_FIELD_DEVELOPER",
     "analyst": "JIRA_FIELD_ANALYST",
+    # Sprint alani panelde SORULMAZ - adi her kurulumda standart oldugu icin
+    # otomatik bulunur (bkz. processor.find_sprint_field_id). Bu anahtar sadece
+    # otomatik bulmanin ise yaramadigi kurulumlar icin bir elle-override yoludur.
+    "sprint": "JIRA_FIELD_SPRINT",
+    # Last Transition da Sprint gibi otomatik bulunur; bu anahtar sadece elle
+    # override icindir (bkz. processor.find_last_transition_field_id).
+    "last_transition": "JIRA_FIELD_LAST_TRANSITION",
 }
 
 
