@@ -43,8 +43,8 @@ def _processed_data() -> dict:
             {
                 "Talep Tipi": ["Task"],
                 "İş Listesi": [TURKISH_PROBE],
-                "Hedeflenen Büyüklük": [5.0],
-                "Gerçekleşen Büyüklük": [3.0],
+                "Hedeflenen Büyüklük (Sp)": [5.0],
+                "Gerçekleşen Büyüklük (Sp)": [3.0],
                 "Hedeflenen Statü": ["Done"],
                 "Gerçekleşen Statü": ["In Progress"],
             }
@@ -53,9 +53,8 @@ def _processed_data() -> dict:
             {
                 "Talep Tipi": ["Bug"],
                 "İş Listesi": ["Plan dışı iş - ığşĞİŞ"],
-                "Gerçekleşen Büyüklük": [2.0],
+                "Gerçekleşen Büyüklük (Sp)": [2.0],
                 "Gerçekleşen Statü": ["Done"],
-                "Hedef Statü": ["Done"],
             }
         ),
         "summary": {
@@ -108,13 +107,22 @@ class CreatePdfReportTests(unittest.TestCase):
     def test_tum_bolumler_yer_alir(self):
         for beklenen in (
             "İterasyon Bazlı İş Büyüklüğü",
-            "Statü Dağılımı",
-            "Kişi Bazlı İş Yükü",
             "planlanan iş listemiz",
             "plan dışı iş listemiz",
         ):
             with self.subTest(bolum=beklenen):
                 self.assertIn(beklenen, self.text)
+
+    def test_e_postada_istenmeyen_bolumler_rapora_girmez(self):
+        """Rapor formati iterasyon kapanis e-postasindaki bolumlerle SINIRLIDIR;
+        statu dagilimi / kisi bazli yuk gibi ek analizler PDF'e girmez."""
+        for istenmeyen in ("Statü Dağılımı", "Kişi Bazlı İş Yükü"):
+            with self.subTest(bolum=istenmeyen):
+                self.assertNotIn(istenmeyen, self.text)
+
+    def test_plan_disi_tablo_dort_kolondur(self):
+        """E-posta plan disi liste icin dort kolon sayar - "Hedef Statü" YOKTUR."""
+        self.assertNotIn("Hedef Statü", self.text)
 
     def test_kpi_degerleri_yazilir(self):
         self.assertIn("Taahhüt Edilen SP", self.text)
@@ -122,7 +130,6 @@ class CreatePdfReportTests(unittest.TestCase):
 
     def test_is_listesi_satirlari_yazilir(self):
         self.assertIn("Plan dışı iş", self.text)
-        self.assertIn("GİZEM YILMAZ", self.text)
 
     def test_hedef_ay_basliklara_islenir(self):
         self.assertIn("Eylül 2026", self.text)

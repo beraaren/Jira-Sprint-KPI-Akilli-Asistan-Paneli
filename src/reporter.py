@@ -46,14 +46,10 @@ METRIC_COLUMNS: list[tuple[str, str]] = [
     ("total_completed_sp", "Toplam Tamamlanan"),
 ]
 
-# processor.py tablolarindaki kolon adlarini rapor gereksinimindeki "(Sp)" etiketine cevirir.
-PLANNED_COLUMN_RENAME = {
-    "Hedeflenen Büyüklük": "Hedeflenen Büyüklük (Sp)",
-    "Gerçekleşen Büyüklük": "Gerçekleşen Büyüklük (Sp)",
-}
-OUT_OF_PLAN_COLUMN_RENAME = {
-    "Gerçekleşen Büyüklük": "Gerçekleşen Büyüklük (Sp)",
-}
+# Not: "(Sp)" son ekli kolon adlari artik dogrudan processor.py'nin
+# `build_planned_issues_table`/`build_out_of_plan_issues_table` fonksiyonlarindan
+# gelir - Excel, PDF ve panelin ekran tablolari AYNI basliklari kullansin diye.
+# Bu yuzden burada ayrica bir yeniden adlandirma YAPILMAZ.
 
 
 @dataclass
@@ -229,8 +225,8 @@ def create_excel_report(
     planned_title = f"{prefix}planlanan iş listemiz ve statüleri:" if prefix else "Planlanan iş listemiz ve statüleri:"
     out_of_plan_title = f"{prefix}plan dışı iş listemiz ve statüleri:" if prefix else "Plan dışı iş listemiz ve statüleri:"
 
-    planned_df = processed_data["planned_issues"].rename(columns=PLANNED_COLUMN_RENAME)
-    out_of_plan_df = processed_data["out_of_plan_issues"].rename(columns=OUT_OF_PLAN_COLUMN_RENAME)
+    planned_df = processed_data["planned_issues"]
+    out_of_plan_df = processed_data["out_of_plan_issues"]
 
     wb = Workbook()
     ws = wb.active

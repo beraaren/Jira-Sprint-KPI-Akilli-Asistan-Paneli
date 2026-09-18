@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
@@ -30,6 +31,7 @@ __all__ = [
     "compare_iterations",
     "calculate_monthly_kpis",
     "build_monthly_history",
+    "build_month_sprint_labels",
     "calculate_yearly_monthly_kpis",
     "build_yearly_monthly_history",
     "compare_yearly_sprints",
@@ -41,6 +43,7 @@ __all__ = [
     "calculate_assignee_metrics",
     "get_assignee_deep_dive",
     "calculate_status_breakdown",
+    "drop_duplicate_rows",
     "compare_multi_sprints",
     "search_issues_by_query",
     "analyze_projects_by_subject",
@@ -98,6 +101,17 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "olusturma tarihi",
     ],
     "resolved": ["resolved", "resolved date", "çözüm tarihi", "cozum tarihi"],
+    # Kartin EN SON statu degisikliginin zamani. Gercek veride `resolved` tamamen
+    # bos oldugu icin "bu is ne zaman hareket etti/bitti" sorusunun TEK kaynagi
+    # budur - haftalik analiz (bkz. src/weekly_report.py) buna dayanir.
+    "last_transition": [
+        "last transition",
+        "custom field (last transition)",
+        "son geçiş",
+        "son gecis",
+        "son geçiş tarihi",
+        "son gecis tarihi",
+    ],
 }
 
 # Bu alanlar bulunamazsa rapor islenemez.
@@ -119,6 +133,29 @@ DONE_STATUS = "done"
 
 # Summary icindeki "(%80)" gibi yuzde ifadelerini yakalar.
 PERCENT_PATTERN = re.compile(r"%\s*(\d{1,3})")
+
+# Turkce karakterleri ASCII karsiliklarina indirger. Sprint adlari ayni projede
+# bile tutarsiz yazilir ("MS Sprint - Ağustos 25" ama "MS Sprint - Agustos 26",
+# "Şubat" ama "Subat"); ay adi eslestirmesi bu indirgenmis hal uzerinden yapilir.
+_TR_ASCII_TABLE = str.maketrans(
+    {
+        "ç": "c", "Ç": "c", "ğ": "g", "Ğ": "g", "ı": "i", "I": "i", "İ": "i",
+        "ö": "o", "Ö": "o", "ş": "s", "Ş": "s", "ü": "u", "Ü": "u",
+    }
+)
+
+# ASCII'ye indirgenmis ay adi -> ay numarasi (MONTH_LABELS_TR'nin tersi).
+MONTH_NUMBERS_TR = {
+    "ocak": 1, "subat": 2, "mart": 3, "nisan": 4, "mayis": 5, "haziran": 6,
+    "temmuz": 7, "agustos": 8, "eylul": 9, "ekim": 10, "kasim": 11, "aralik": 12,
+}
+
+# Sprint adindan ay ve yil yakalar: "MS Sprint - Temmuz 26" -> ("temmuz", "26").
+# Yil 4, 2 ya da (veride goruldugu uzere KESIK) 1 haneli olabilir - bkz.
+# `build_sprint_period_map`.
+SPRINT_MONTH_PATTERN = re.compile(
+    r"\b(" + "|".join(MONTH_NUMBERS_TR) + r")\b[\s._/-]*(\d{1,4})\b"
+)
 
 ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp1254", "iso-8859-9")
 
@@ -488,6 +525,77 @@ def jira_person_field_to_display(value: object) -> str:
     return str(value)
 
 
+# Jira'nin Sprint alani her kurulumda farkli bir `customfield_XXXXX` ID'sine
+# sahiptir ama ADI standarttir - bu yuzden Story Points/Developer/Analist'in
+# aksine kullaniciya SORULMAZ, ad uzerinden otomatik bulunur (bkz.
+# `find_sprint_field_id`). `.env`'deki JIRA_FIELD_SPRINT ile elle de verilebilir.
+JIRA_SPRINT_FIELD_NAMES = ("sprint", "sprints")
+
+# Kartin son statu degisikliginin zamani - haftalik analizin dayandigi alan
+# (bkz. COLUMN_ALIASES["last_transition"]). Sprint gibi, adi standart oldugu icin
+# kullaniciya sorulmaz, `/field` uzerinden ada gore bulunur.
+JIRA_LAST_TRANSITION_FIELD_NAMES = ("last transition", "son geçiş", "son gecis")
+
+# Jira Data Center'in eski Sprint temsili duz metindir:
+# "com.atlassian.greenhopper.service.sprint.Sprint@1a2b[id=42,name=MS Sprint - Temmuz 26,...]"
+_SPRINT_TOSTRING_NAME = re.compile(r"name=([^,\]]+)")
+
+
+def find_field_id_by_name(all_fields: object, names: tuple[str, ...]) -> str | None:
+    """Jira'nin `/rest/api/2/field` ciktisinda adi `names`'ten biriyle eslesen
+    alanin ID'sini doner; bulunamazsa None.
+
+    Alan ID'leri (`customfield_XXXXX`) her Jira kurulumunda farklidir ama bazi
+    alanlarin ADI standarttir (Sprint, Last Transition) - bunlar Story Points/
+    Developer/Analist'in aksine kullaniciya SORULMAZ, ad uzerinden bulunur.
+
+    Girdinin BEKLENEN bicimde (sozluk listesi) gelmedigi durumlar da sessizce
+    None ile karsilanir: bu fonksiyon "bulabilirse iyi" mantigiyla cagrilir, veri
+    cekiminin tamamini bir alan kesfi yuzunden dusurmemelidir."""
+    if not isinstance(all_fields, list):
+        return None
+    for field in all_fields:
+        if not isinstance(field, dict):
+            continue
+        if _normalize_header(field.get("name")) in names:
+            field_id = field.get("id")
+            if field_id:
+                return str(field_id)
+    return None
+
+
+def find_sprint_field_id(all_fields: object) -> str | None:
+    """Sprint alaninin ID'si (bkz. `find_field_id_by_name`). Bulunamazsa ay
+    atamasi `created` tarihine duser - bkz. `_row_month_keys`."""
+    return find_field_id_by_name(all_fields, JIRA_SPRINT_FIELD_NAMES)
+
+
+def find_last_transition_field_id(all_fields: object) -> str | None:
+    """Last Transition alaninin ID'si (bkz. `find_field_id_by_name`).
+    Bulunamazsa haftalik analiz calisamaz ama diger tum raporlar etkilenmez."""
+    return find_field_id_by_name(all_fields, JIRA_LAST_TRANSITION_FIELD_NAMES)
+
+
+def jira_sprint_field_to_display(value: object) -> str:
+    """Bir kartin Sprint alanini, CSV disa aktarimindaki gibi VIRGULLE AYRILMIS
+    tek bir metne cevirir - `standardize_dataframe` boylece API'den gelen veriyi
+    CSV'den gelenle AYNI sekilde isler.
+
+    Jira surumune gore uc bicim de karsilanir: nesne listesi
+    (`[{"name": "MS Sprint - Temmuz 26"}]`), duz metin listesi ve Data Center'in
+    `Sprint@...[id=..,name=..,..]` toString bicimi."""
+    if not value:
+        return ""
+    if isinstance(value, list):
+        names = [jira_sprint_field_to_display(item) for item in value]
+        return ", ".join(n for n in names if n)
+    if isinstance(value, dict):
+        return str(value.get("name") or "")
+    text = str(value)
+    match = _SPRINT_TOSTRING_NAME.search(text)
+    return match.group(1).strip() if match else text.strip()
+
+
 def discover_jira_fields(base_url: str, token: str, project_key: str, verify: bool = True) -> dict:
     """Jira'ya baglanip TUM alan listesini VE kucuk bir ornek veri setini (son 5
     kart) doner - `fetch_issues_from_jira_api` ile TAM veri cekmeden ONCE,
@@ -559,7 +667,12 @@ def discover_jira_fields(base_url: str, token: str, project_key: str, verify: bo
 
 
 def _jira_issue_to_row(
-    issue: dict, story_points_id: str | None, developer_id: str | None, analyst_id: str | None
+    issue: dict,
+    story_points_id: str | None,
+    developer_id: str | None,
+    analyst_id: str | None,
+    sprint_id: str | None = None,
+    last_transition_id: str | None = None,
 ) -> dict:
     """Jira'nin HAM issue JSON'unu, `COLUMN_ALIASES`'taki (ve Developer/Analist icin
     `DEVELOPERS_HEADER_EXACT`/`ANALYSTS_HEADER_EXACT`'taki) aday basliklarla BIREBIR
@@ -587,6 +700,41 @@ def _jira_issue_to_row(
         "Story Points": fields.get(story_points_id, "") if story_points_id else "",
         "Developers": jira_person_field_to_display(fields.get(developer_id)) if developer_id else "",
         "Analysts": jira_person_field_to_display(fields.get(analyst_id)) if analyst_id else "",
+        "Sprint": jira_sprint_field_to_display(fields.get(sprint_id)) if sprint_id else "",
+        "Last Transition": (fields.get(last_transition_id, "") or "") if last_transition_id else "",
+    }
+
+
+def _lookup_auto_field_ids(
+    base_url: str, headers: dict[str, str], project_key: str, verify: bool
+) -> dict[str, str | None]:
+    """Kullaniciya SORULMADAN, adi uzerinden bulunan alanlarin ID'lerini `/field`
+    uc noktasindan TEK bir istekle toplar: `{"sprint": ..., "last_transition": ...}`.
+
+    Story Points/Developer/Analist'in aksine bu iki alanin adi Jira kurulumlari
+    arasinda standarttir, bu yuzden alan eslestirme ekraninda sorulmazlar
+    (`fetch_issues_from_jira_api` bunlari `field_id_map`'te bulamazsa buraya duser).
+    Iki alan icin ayri ayri degil, tek istekte bakilir.
+
+    Bu istek BASARISIZ OLURSA sessizce bos harita doner ve veri cekimi bu alanlar
+    olmadan devam eder - ikisi de raporun dogrulugunu artiran alanlardir ama onlar
+    yuzunden tum cekimi basarisiz saymak kullanici acisindan daha kotu bir sonuc
+    olur. Sprint yoksa ay atamasi `created` tarihine duser (bkz. `_row_month_keys`);
+    Last Transition yoksa haftalik analiz calismaz (bkz. `src/weekly_report.py`)
+    ama diger raporlar etkilenmez."""
+    try:
+        response = _jira_get(
+            f"{base_url}/{JIRA_API_FIELD_ENDPOINT}", headers, None, project_key, verify
+        )
+        all_fields = response.json()
+    except (JiraApiError, ValueError):  # baglanti/yetki hatasi veya bozuk JSON
+        return {}
+    except Exception:  # noqa: BLE001 - beklenmedik bicim de cekimi dusurmemeli
+        return {}
+
+    return {
+        "sprint": find_sprint_field_id(all_fields),
+        "last_transition": find_last_transition_field_id(all_fields),
     }
 
 
@@ -627,12 +775,24 @@ def fetch_issues_from_jira_api(
     story_points_id = field_id_map.get("story_points")
     developer_id = field_id_map.get("developer")
     analyst_id = field_id_map.get("analyst")
+    # Sprint ve Last Transition kullaniciya sorulmaz; eslestirmede yoksa tek bir
+    # `/field` istegiyle adlarindan bulunur (bkz. `_lookup_auto_field_ids`).
+    sprint_id = field_id_map.get("sprint")
+    last_transition_id = field_id_map.get("last_transition")
+    if not (sprint_id and last_transition_id):
+        auto_ids = _lookup_auto_field_ids(base_url, headers, project_key, verify)
+        sprint_id = sprint_id or auto_ids.get("sprint")
+        last_transition_id = last_transition_id or auto_ids.get("last_transition")
 
     requested_fields = [
         "summary", "issuetype", "status", "assignee", "labels",
         "components", "created", "resolutiondate", "project",
     ]
-    requested_fields.extend(fid for fid in (story_points_id, developer_id, analyst_id) if fid)
+    requested_fields.extend(
+        fid
+        for fid in (story_points_id, developer_id, analyst_id, sprint_id, last_transition_id)
+        if fid
+    )
 
     rows: list[dict] = []
     start_at = 0
@@ -655,12 +815,18 @@ def fetch_issues_from_jira_api(
         issues = payload.get("issues", [])
         if not issues:
             break
-        rows.extend(_jira_issue_to_row(issue, story_points_id, developer_id, analyst_id) for issue in issues)
+        rows.extend(
+            _jira_issue_to_row(
+                issue, story_points_id, developer_id, analyst_id, sprint_id, last_transition_id
+            )
+            for issue in issues
+        )
         start_at += JIRA_FETCH_PAGE_SIZE
 
     export_columns = [
         "Issue Type", "Summary", "Status", "Assignee", "Project", "Component/s",
         "Labels", "Created", "Resolved", "Story Points", "Developers", "Analysts",
+        "Sprint", "Last Transition",
     ]
     return pd.DataFrame(rows, columns=export_columns)
 
@@ -713,6 +879,14 @@ DEVELOPERS_HEADER_PREFIXES = ("custom field (developers",)
 ANALYSTS_HEADER_EXACT = ("analists", "analysts")
 ANALYSTS_HEADER_PREFIXES = ("custom field (analists",)
 
+# Jira'nin "Sprint" alani da coklu-degerlidir (devreden bir kart, icinde yer
+# aldigi HER sprint icin bir deger tasir - veride 14 sprinte kadar cikiyor) ve
+# CSV disa aktariminda ayni ada sahip ARDISIK kolonlara bolunur; pandas bunlari
+# "Sprint", "Sprint.1", "Sprint.2"... diye tekillestirir - bu yuzden Developer/
+# Analist ile AYNI tam-eslesme + on-ek eslesmesi mantigi kullanilir.
+SPRINT_HEADER_EXACT = ("sprint", "sprints")
+SPRINT_HEADER_PREFIXES = ("sprint.", "custom field (sprint")
+
 
 def _combine_multi_value_columns(
     df: pd.DataFrame, exact_names: tuple[str, ...], prefixes: tuple[str, ...]
@@ -753,6 +927,92 @@ def _combine_multi_value_columns(
     return df[columns].apply(_collect, axis=1)
 
 
+def _ascii_fold_tr(text: object) -> str:
+    """Turkce karakterleri ASCII'ye indirger ve kucuk harfe cevirir (bkz.
+    `_TR_ASCII_TABLE`) - "MS Sprint - Ağustos 26" ve "MS Sprint - Agustos 26"
+    ayni sonucu verir."""
+    return str(text).translate(_TR_ASCII_TABLE).lower()
+
+
+def _parse_sprint_label(label: str) -> tuple[int, str] | None:
+    """Bir sprint adindan `(ay_numarasi, yil_jetonu)` cikarir; ay adi
+    bulunamazsa None doner (orn. "Sprint 2", "MS Sprint 3" - bu adlar hicbir aya
+    baglanamaz). Yil jetonu HAM string olarak doner cunku 1 haneli (kesik) olma
+    ihtimali vardir ve cozumu tum veri setinin baglamini gerektirir - bkz.
+    `build_sprint_period_map`."""
+    match = SPRINT_MONTH_PATTERN.search(_ascii_fold_tr(label))
+    if not match:
+        return None
+    return MONTH_NUMBERS_TR[match.group(1)], match.group(2)
+
+
+def build_sprint_period_map(labels: Iterable[str]) -> dict[str, pd.Period]:
+    """Veride gecen TUM sprint adlarini tarayip her birini bir aya (`pd.Period`)
+    baglayan bir sozluk uretir. Ay adi tasimayan adlar (orn. "Sprint 2") sonuca
+    HIC girmez - bu kartlar `filter_by_month` icinde `created` tarihine duser.
+
+    KESIK YIL COZUMU: veride "MS Sprint - Nisan 2" gibi, disa aktarim sirasinda
+    yili kirpilmis adlar bulunur. Tek haneli bir yil jetonu, veride TAM olarak
+    gecen yillar arasindan o rakamla BASLAYANLARA aday olarak bakilarak cozulur;
+    aday yillardan o ay icin ZATEN tam yazilmis bir sprint adi bulunanlar elenir
+    (ayni ay/yil iki farkli adla temsil edilemez). Geriye TEK bir aday kalirsa o
+    secilir, aksi halde ad cozumsuz birakilir (uydurma bir yila baglanmaz).
+    Ornek: "Nisan 2" -> adaylar 2025/2026; "Nisan 25" veride tam yazili oldugu
+    icin 2025 elenir -> Nisan 2026.
+    """
+    parsed: dict[str, tuple[int, str]] = {}
+    for label in {str(x).strip() for x in labels if str(x).strip()}:
+        result = _parse_sprint_label(label)
+        if result is not None:
+            parsed[label] = result
+
+    def _full_year(token: str) -> int | None:
+        if len(token) == 4:
+            return int(token)
+        if len(token) == 2:
+            return 2000 + int(token)
+        return None
+
+    period_map: dict[str, pd.Period] = {}
+    known_years: set[int] = set()
+    claimed: set[tuple[int, int]] = set()  # tam yazilmis (ay, yil) ciftleri
+    for label, (month, token) in parsed.items():
+        year = _full_year(token)
+        if year is None:
+            continue
+        period_map[label] = pd.Period(year=year, month=month, freq="M")
+        known_years.add(year)
+        claimed.add((month, year))
+
+    for label, (month, token) in parsed.items():
+        if label in period_map:
+            continue
+        candidates = [
+            year
+            for year in known_years
+            if str(year % 100).startswith(token) and (month, year) not in claimed
+        ]
+        if len(candidates) == 1:
+            period_map[label] = pd.Period(year=candidates[0], month=month, freq="M")
+
+    return period_map
+
+
+def _sprint_month_keys(sprint_lists: pd.Series, period_map: dict[str, pd.Period]) -> pd.Series:
+    """Her satirin sprint adi listesini, cozulebilen aylarin `"YYYY-MM"`
+    anahtarlarindan olusan (tekrarsiz, sirali) bir listeye cevirir. Period
+    nesnesi yerine duz string tutulur - liste iceren kolonlar Streamlit/Arrow
+    tarafinda serilestirildiginden `developers`/`analysts` ile ayni sekilde
+    guvenli kalir."""
+
+    def _keys(labels: object) -> list[str]:
+        if not isinstance(labels, list):
+            return []
+        return sorted({str(period_map[l]) for l in labels if l in period_map})
+
+    return sprint_lists.map(_keys)
+
+
 def standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Ham DataFrame'i kanonik kolon adlarina cevirir, eksik/bos verileri guvenli sekilde doldurur.
 
@@ -769,6 +1029,7 @@ def standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     # satirindan ONCE (kolonlar hala mevcutken) ayri olarak toplanir, sonra tekrar eklenir.
     developers_series = _combine_multi_value_columns(df, DEVELOPERS_HEADER_EXACT, DEVELOPERS_HEADER_PREFIXES)
     analysts_series = _combine_multi_value_columns(df, ANALYSTS_HEADER_EXACT, ANALYSTS_HEADER_PREFIXES)
+    sprint_series = _combine_multi_value_columns(df, SPRINT_HEADER_EXACT, SPRINT_HEADER_PREFIXES)
 
     normalized_lookup = {_normalize_header(c): c for c in df.columns}
 
@@ -791,6 +1052,10 @@ def standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = df[list(COLUMN_ALIASES.keys())]
     df["developers"] = developers_series
     df["analysts"] = analysts_series
+    df["sprint"] = sprint_series
+    df["sprint_months"] = _sprint_month_keys(
+        sprint_series, build_sprint_period_map(sprint_series.explode().dropna())
+    )
 
     for text_col in ("issue_type", "summary", "status", "labels", "assignee", "project", "component"):
         df[text_col] = df[text_col].fillna("").astype(str).str.strip()
@@ -798,6 +1063,7 @@ def standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     df["estimate"] = pd.to_numeric(df["estimate"], errors="coerce").fillna(0.0)
     df["created"] = _parse_jira_date(df["created"])
     df["resolved"] = _parse_jira_date(df["resolved"])
+    df["last_transition"] = _parse_jira_date(df["last_transition"])
 
     return df.reset_index(drop=True)
 
@@ -895,6 +1161,35 @@ def filter_by_project(df: pd.DataFrame, project: str | None = None) -> pd.DataFr
     return _filter_by_text_column(df, "project", project)
 
 
+def drop_duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """`df.drop_duplicates()`'in, LISTE iceren kolonlara dayanikli hali.
+
+    Standardize edilmis veride coklu-degerli alanlar Python listesi olarak tutulur
+    (`developers`, `analysts`, `sprint`, `sprint_months`). pandas bir listeyi
+    hash'leyemedigi icin duz `drop_duplicates()` bu kolonlar varken
+    `TypeError: unhashable type: 'list'` ile duser. Burada tekillestirme SADECE
+    hash'lenebilir kolonlar uzerinden yapilir; liste kolonlari sonuctan SILINMEZ,
+    yalnizca ANAHTARA girmez.
+
+    Liste kolonlari zaten karttan turedigi icin ayni kart icin hep ayni degeri
+    tasir - onlari anahtardan cikarmak sonucu degistirmez. Kolonlarin korunmasi
+    ise onemlidir: orn. `sprint_months` silinseydi, sonucu kullanan
+    `filter_by_month` ay atamasini sprint yerine sessizce `created` tarihinden
+    yapardi (bkz. `_row_month_keys`).
+
+    Hic hash'lenebilir kolon yoksa `df` oldugu gibi doner (tekillestirilecek bir
+    anahtar yoktur).
+    """
+    hashable_columns = [
+        column
+        for column in df.columns
+        if not df[column].map(lambda value: isinstance(value, list)).any()
+    ]
+    if not hashable_columns:
+        return df
+    return df.drop_duplicates(subset=hashable_columns)
+
+
 def explode_by_role(df: pd.DataFrame, role_column: str, fallback_to_assignee: bool = True) -> pd.DataFrame:
     """`role_column` (`"developers"` veya `"analysts"`) kolonundaki coklu-deger
     listesini "patlatip" (explode) her kisi icin AYRI bir satir + yeni bir "person"
@@ -969,7 +1264,7 @@ def calculate_sprint_kpis(df: pd.DataFrame) -> SprintKPIs:
 def calculate_assignee_metrics(df: pd.DataFrame, target_month: str | None = None) -> pd.DataFrame:
     """`assignee` (sorumlu) bazinda toplam is sayisi, toplam yuk (SP) ve tamamlanan SP hesaplar.
 
-    `target_month` verilirse once `created` tarihine gore o aya filtrelenir; verilmezse
+    `target_month` verilirse once o aya filtrelenir (bkz. `filter_by_month` - once SPRINT alani, yoksa `created`); verilmezse
     tum veri (tum aylar) kullanilir. Sonuc, toplam yuke gore azalan sirada doner.
     """
     scoped = filter_by_month(df, target_month) if target_month else df
@@ -1045,7 +1340,7 @@ def get_assignee_deep_dive(
 def calculate_status_breakdown(df: pd.DataFrame, target_month: str | None = None) -> pd.DataFrame:
     """`status` (statu/asama) bazinda is adedi ve toplam SP dagilimini hesaplar.
 
-    `target_month` verilirse once `created` tarihine gore o aya filtrelenir; verilmezse
+    `target_month` verilirse once o aya filtrelenir (bkz. `filter_by_month` - once SPRINT alani, yoksa `created`); verilmezse
     tum veri (tum aylar) kullanilir. Sonuc, is adedine gore azalan sirada doner.
     """
     scoped = filter_by_month(df, target_month) if target_month else df
@@ -1063,7 +1358,7 @@ def calculate_status_breakdown(df: pd.DataFrame, target_month: str | None = None
 
 
 # --------------------------------------------------------------------------
-# Aylik gruplama (Created tarihine gore)
+# Aylik gruplama (once SPRINT alani, yoksa Created tarihine gore - bkz. _row_month_keys)
 # --------------------------------------------------------------------------
 
 
@@ -1071,23 +1366,66 @@ def _month_label(period: pd.Period) -> str:
     return f"{MONTH_LABELS_TR[period.month]} {period.year}"
 
 
+def _row_month_keys(df: pd.DataFrame) -> pd.Series:
+    """Her kartin HANGI AY(LAR)A ait sayilacagini `"YYYY-MM"` anahtarlarindan
+    olusan bir liste olarak doner - tum ay bazli filtreleme/gruplamanin TEK
+    kaynagi.
+
+    Oncelik SPRINT alanindadir: rapor gereksinimi "ilgili sprinte ait kartlar"
+    dedigi icin bir kart, ACILDIGI aya degil, icinde yer aldigi SPRINT(ler)in
+    ayina aittir. Devreden bir kart birden fazla sprintte yer alir ve her birinde
+    AYRI AYRI sayilir (gereksinim "her bir sprint icin ... toplami" dedigi icin
+    bu kasitlidir).
+
+    Sprint bilgisi olmayan ya da adindan ay cikarilamayan kartlarda (orn.
+    "Sprint 2", "MS Sprint 3" veya Sprint alani bos kartlar) eski davranisa,
+    yani `created` tarihinin ayina DUSULUR - boylece hicbir kart tamamen
+    kaybolmaz. Ne sprint ne `created` varsa kart hicbir aya girmez."""
+    has_sprint = "sprint_months" in df.columns
+    has_created = "created" in df.columns
+
+    created_keys = (
+        df["created"].dt.to_period("M").map(lambda p: [] if pd.isna(p) else [str(p)])
+        if has_created and pd.api.types.is_datetime64_any_dtype(df["created"])
+        else pd.Series([[] for _ in range(len(df))], index=df.index)
+    )
+    if not has_sprint:
+        return created_keys
+
+    return pd.Series(
+        [
+            list(sprint) if isinstance(sprint, list) and sprint else created
+            for sprint, created in zip(df["sprint_months"], created_keys)
+        ],
+        index=df.index,
+    )
+
+
 def _monthly_periods_window(
     df: pd.DataFrame, last_n_months: int | None, end_month: str | None
 ) -> tuple[pd.DataFrame, list[pd.Period]]:
-    """`created` tarihine gore kartlari aylara ayirip, `end_month`'a kadar (dahil) ve
-    (verilmisse) sadece son `last_n_months` ayi kapsayacak sekilde bir donem
-    penceresi olusturur. `calculate_monthly_kpis` ve plan disi kapasite tahmininin
-    (bkz. `_monthly_committed_completed`) AYNI ay secme mantigini paylasmasi icin bu
+    """Kartlari aylara ayirip (bkz. `_row_month_keys` - once SPRINT alani, yoksa
+    `created`), `end_month`'a kadar (dahil) ve (verilmisse) sadece son
+    `last_n_months` ayi kapsayacak sekilde bir donem penceresi olusturur.
+    `calculate_monthly_kpis` ve plan disi kapasite tahmininin (bkz.
+    `_monthly_committed_completed`) AYNI ay secme mantigini paylasmasi icin bu
     pencereleme mantigi ortak bir yerden yonetilir - boylece "hangi aylar dahil
     edilecek" kurali (end_month kaydirma, last_n_months kirpma) TEK bir yerde
-    tanimlanir. `created` verisi bulunamazsa/tamamen bossa (bos DataFrame, bos
-    donem listesi) doner.
+    tanimlanir. Hicbir karta ay atanamazsa (bos DataFrame, bos donem listesi) doner.
+
+    Birden fazla sprintte yer alan (devreden) bir kart, donen `DataFrame`'de HER
+    ayi icin BIR satir olarak coğaltilir - boylece cagiran taraf tek bir
+    `_period` kolonuna bakarak, kartin o ayin toplamina girmesini saglar.
     """
-    if "created" not in df.columns or df["created"].isna().all():
+    keys = _row_month_keys(df)
+    if not keys.map(bool).any():
         return df.iloc[0:0], []
 
-    dated = df.loc[df["created"].notna()].copy()
-    dated["_period"] = dated["created"].dt.to_period("M")
+    dated = df.copy()
+    dated["_period"] = keys
+    dated = dated.explode("_period")
+    dated = dated.loc[dated["_period"].notna()].copy()
+    dated["_period"] = dated["_period"].map(lambda key: pd.Period(key, freq="M"))
 
     periods = sorted(dated["_period"].unique())
 
@@ -1177,7 +1515,8 @@ def compare_multi_sprints(df: pd.DataFrame, last_n_months: int | None = None) ->
 
 
 def calculate_yearly_monthly_kpis(df: pd.DataFrame, target_month: str | None = None) -> dict[str, SprintKPIs]:
-    """`created` tarihine gore kartlari aylara ayirip, `target_month`'un icinde
+    """Kartlari aylara ayirip (bkz. `_row_month_keys` - once SPRINT alani, yoksa
+    `created`), `target_month`'un icinde
     bulundugu TAKVIM YILINA ait, hedef ay DAHIL olacak sekilde ONDAN ONCEKI (o yil
     icindeki) tum aylar icin ayri `SprintKPIs` hesaplar - "yil-basi-ndan-bugune
     (year-to-date) karsilastirma". Bu, `calculate_monthly_kpis`'in sabit sayida
@@ -1188,26 +1527,16 @@ def calculate_yearly_monthly_kpis(df: pd.DataFrame, target_month: str | None = N
     ise sadece Ocak 2025 doner).
 
     `target_month` verilmezse veride bulunan en guncel ayin yili ve o ay kullanilir.
-    `created` kolonu bulunamadiysa/tamamen bossa bos bir sozluk doner.
+    Hicbir karta ay atanamazsa bos bir sozluk doner.
     """
-    if "created" not in df.columns or df["created"].isna().all():
-        return {}
-
-    dated = df.loc[df["created"].notna()].copy()
-    dated["_period"] = dated["created"].dt.to_period("M")
-
-    periods = sorted(dated["_period"].unique())
+    # `_monthly_periods_window` pencereyi zaten hedef aya kadar (dahil) kirptigi
+    # icin burada geriye sadece "ayni takvim yili" kisitini uygulamak kalir.
+    dated, periods = _monthly_periods_window(df, last_n_months=None, end_month=target_month)
     if not periods:
         return {}
 
-    if target_month is not None:
-        normalized_target = _normalize_header(target_month)
-        matching_periods = [p for p in periods if normalized_target in _normalize_header(_month_label(p))]
-        target_period = matching_periods[-1] if matching_periods else periods[-1]
-    else:
-        target_period = periods[-1]
-
-    year_to_date_periods = [p for p in periods if p.year == target_period.year and p <= target_period]
+    target_period = periods[-1]
+    year_to_date_periods = [p for p in periods if p.year == target_period.year]
 
     return {
         _month_label(period): calculate_sprint_kpis(dated.loc[dated["_period"] == period])
@@ -1248,22 +1577,50 @@ def compare_yearly_sprints(df: pd.DataFrame, target_month: str | None = None) ->
     return result
 
 
+def build_month_sprint_labels(df: pd.DataFrame) -> dict[str, list[str]]:
+    """Her ay etiketini (orn. `"Temmuz 2026"`) o aya cozulen SPRINT ADLARINA
+    (orn. `["MS Sprint - Temmuz 26"]`) esler.
+
+    Arayuzun ay secim kutusunda, kullanicinin Jira'da GORDUGU sprint adini
+    gosterebilmesi icindir (bkz. `app/new_dashboard.py`). Bir ay listede olup da
+    burada karsiligi bulunmuyorsa, o aya sadece `created` tarihinden dusen
+    kartlar uzerinden ulasilmis demektir (sprint adi cozulemeyen kartlar - bkz.
+    `_row_month_keys`); arayuz bu durumu ayrica belirtir.
+
+    Sprint bilgisi hic olmayan bir veri setinde bos sozluk doner."""
+    if "sprint" not in df.columns or "sprint_months" not in df.columns:
+        return {}
+
+    labels_by_month: dict[str, set[str]] = {}
+    period_map = build_sprint_period_map(df["sprint"].explode().dropna())
+    for sprint_name, period in period_map.items():
+        labels_by_month.setdefault(_month_label(period), set()).add(sprint_name)
+
+    return {month: sorted(names) for month, names in labels_by_month.items()}
+
+
 def latest_month_label(df: pd.DataFrame) -> str | None:
-    """`created` tarihine gore veride bulunan en guncel ayin etiketini (orn. 'Ağustos 2026')
-    doner. `created` kolonu yoksa/tamamen bossa None doner."""
-    if "created" not in df.columns or df["created"].isna().all():
+    """Veride bulunan en guncel ayin etiketini (orn. 'Ağustos 2026') doner - ay
+    atamasi `_row_month_keys` ile yapilir (once SPRINT alani, yoksa `created`).
+    Hicbir karta ay atanamazsa None doner."""
+    keys = {key for row_keys in _row_month_keys(df) for key in row_keys}
+    if not keys:
         return None
-    latest_period = df["created"].dropna().dt.to_period("M").max()
-    return _month_label(latest_period)
+    return _month_label(pd.Period(max(keys), freq="M"))
 
 
 def filter_by_month(df: pd.DataFrame, target_month: str | None = None) -> pd.DataFrame:
-    """`created` tarihine gore `target_month`'a ait kartlari filtreler.
+    """`target_month`'a ait kartlari filtreler. Bir kartin hangi aya ait sayildigi
+    `_row_month_keys` ile belirlenir: ONCE Jira'nin SPRINT alani (gereksinimdeki
+    "ilgili sprinte ait kartlar" kurali), sprint adindan ay cikarilamiyorsa
+    `created` tarihi. Bu nedenle Temmuz sprintine devreden ama Mart'ta acilmis bir
+    kart Temmuz raporuna DAHIL edilir; Temmuz'da acilip Agustos sprintine alinmis
+    bir kart ise Temmuz raporuna GIRMEZ.
 
     `target_month`, tam etiket (`"Temmuz 2026"`) veya sadece ay adi (`"Temmuz"`) olabilir;
     sadece ay adi verilip birden fazla yila denk gelirse en guncel yil secilir.
-    `target_month` verilmezse veride bulunan en guncel ay kullanilir. `created` kolonu
-    yoksa/tamamen bossa (filtrelenemedigi icin) tum `df`'i doner.
+    `target_month` verilmezse veride bulunan en guncel ay kullanilir. Hicbir karta ay
+    atanamiyorsa (filtrelenemedigi icin) tum `df`'i doner.
 
     `target_month` VERILMIS ama bu spesifik `df` icinde (orn. onceden belirli bir
     kisiye/projeye `filter_by_assignee`/`filter_by_project` ile daraltilmis bir alt
@@ -1274,26 +1631,25 @@ def filter_by_month(df: pd.DataFrame, target_month: str | None = None) -> pd.Dat
     kisinin secili ayda hic karti yokken tum aylardaki kartlarinin o aya aitmis gibi
     yanlislikla gosterilmesine yol aciyordu.
     """
-    if "created" not in df.columns or df["created"].isna().all():
+    row_keys = _row_month_keys(df)
+    all_keys = sorted({key for keys in row_keys for key in keys})
+    if not all_keys:
         return df
 
-    periods = df["created"].dt.to_period("M")
-
     if target_month is None:
-        target_period = periods.dropna().max()
-        if target_period is None or pd.isna(target_period):
-            return df
-        return df.loc[periods == target_period].reset_index(drop=True)
+        target_key = all_keys[-1]
+    else:
+        normalized_target = _normalize_header(target_month)
+        matching = [
+            key
+            for key in all_keys
+            if normalized_target in _normalize_header(_month_label(pd.Period(key, freq="M")))
+        ]
+        if not matching:
+            return df.iloc[0:0]
+        target_key = matching[-1]
 
-    normalized_target = _normalize_header(target_month)
-    matching_periods = sorted(
-        p for p in periods.dropna().unique() if normalized_target in _normalize_header(_month_label(p))
-    )
-    if not matching_periods:
-        return df.iloc[0:0]
-
-    target_period = matching_periods[-1]
-    return df.loc[periods == target_period].reset_index(drop=True)
+    return df.loc[row_keys.map(lambda keys: target_key in keys)].reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------
@@ -1320,8 +1676,8 @@ def build_planned_issues_table(df: pd.DataFrame, target_month: str | None = None
         {
             "Talep Tipi": planned["issue_type"],
             "İş Listesi": planned["summary"],
-            "Hedeflenen Büyüklük": planned["estimate"],
-            "Gerçekleşen Büyüklük": planned["estimate"].where(done_mask, 0),
+            "Hedeflenen Büyüklük (Sp)": planned["estimate"],
+            "Gerçekleşen Büyüklük (Sp)": planned["estimate"].where(done_mask, 0),
             "Hedeflenen Statü": planned["summary"].map(_target_status),
             "Gerçekleşen Statü": planned["status"],
         }
@@ -1329,10 +1685,16 @@ def build_planned_issues_table(df: pd.DataFrame, target_month: str | None = None
 
 
 def build_out_of_plan_issues_table(df: pd.DataFrame, target_month: str | None = None) -> pd.DataFrame:
-    """Plan disi isler icin: Talep Tipi, Is Listesi, Gerceklesen Buyukluk ve Gerceklesen Statu kolonlari.
+    """Plan disi isler icin: Talep Tipi, Is Listesi, Gerceklesen Buyukluk (Sp) ve
+    Gerceklesen Statu kolonlari.
 
-    `created` tarihine gore sadece `target_month`'a (verilmezse veride bulunan en guncel
-    aya) ait kartlari icerir; gecmis aylarin kartlari listelenmez.
+    Rapor gereksinimi plan disi liste icin SADECE bu DORT kolonu sayar - planlanan
+    listesindeki "Hedeflenen ..." kolonlarinin plan disi isler icin karsiligi yoktur
+    (bu isler taahhut edilmemistir). Bu yuzden burada bir "Hedef Statü" kolonu
+    URETILMEZ.
+
+    Sadece `target_month`'a (verilmezse veride bulunan en guncel aya) ait kartlari
+    icerir; gecmis aylarin kartlari listelenmez.
     """
     month_df = filter_by_month(df, target_month)
     out_of_plan = filter_out_of_plan_issues(month_df)
@@ -1342,9 +1704,8 @@ def build_out_of_plan_issues_table(df: pd.DataFrame, target_month: str | None = 
         {
             "Talep Tipi": out_of_plan["issue_type"],
             "İş Listesi": out_of_plan["summary"],
-            "Gerçekleşen Büyüklük": out_of_plan["estimate"].where(done_mask, 0),
+            "Gerçekleşen Büyüklük (Sp)": out_of_plan["estimate"].where(done_mask, 0),
             "Gerçekleşen Statü": out_of_plan["status"],
-            "Hedef Statü": out_of_plan["summary"].map(_target_status),
         }
     )
 
@@ -1370,7 +1731,7 @@ def search_issues_by_query(
     yeterlidir (AND mantigi). `query_text` bos/bosluktan ibaretse metin filtresi
     uygulanmaz.
 
-    `target_month` verilirse once `created` tarihine gore o aya filtrelenir; verilmezse
+    `target_month` verilirse once o aya filtrelenir (bkz. `filter_by_month` - once SPRINT alani, yoksa `created`); verilmezse
     tum veri (tum aylar) icinde aranir.
     """
     scoped = filter_by_month(df, target_month) if target_month else df
@@ -1416,7 +1777,7 @@ def analyze_projects_by_subject(df: pd.DataFrame, target_month: str | None = Non
     alanina dayanir. `component` bos olan kartlar `NO_COMPONENT_LABEL`
     ("Component Yok") adinda ayri bir grupta toplanir, analizden cikarilmaz.
 
-    `target_month` verilirse once `created` tarihine gore o aya filtrelenir; verilmezse
+    `target_month` verilirse once o aya filtrelenir (bkz. `filter_by_month` - once SPRINT alani, yoksa `created`); verilmezse
     tum veri (tum aylar) kullanilir. Sonuc, Toplam SP'ye gore azalan sirada doner
     (en cok kaynak tuketen proje/konu ilk satirda) ve su kolonlari icerir:
     `Proje/Konu`, `Toplam İş Sayısı`, `Toplam SP`, `Tamamlanan SP`,
@@ -1527,7 +1888,7 @@ def detect_bottlenecks(df: pd.DataFrame, target_month: str | None = None) -> dic
     """Henuz tamamlanmamis (Done disi) ve iptal edilmemis aktif isleri statu ve
     buyukluk (SP) bazinda gruplayip olasi darbogazlari one cikaran bir rapor uretir.
 
-    `target_month` verilirse once `created` tarihine gore o aya filtrelenir; verilmezse
+    `target_month` verilirse once o aya filtrelenir (bkz. `filter_by_month` - once SPRINT alani, yoksa `created`); verilmezse
     tum veri (tum aylar) kullanilir.
 
     Donen `dict`:
@@ -1593,7 +1954,7 @@ def analyze_estimation_accuracy(df: pd.DataFrame, target_month: str | None = Non
     """Talep tipine (`issue_type`) gore, hedeflenen (planlanan) SP ile gerceklesen
     (tamamlanan/`Done`) SP arasindaki sapmayi ve tahmin dogruluk oranini hesaplar.
 
-    `target_month` verilirse once `created` tarihine gore o aya filtrelenir; verilmezse
+    `target_month` verilirse once o aya filtrelenir (bkz. `filter_by_month` - once SPRINT alani, yoksa `created`); verilmezse
     tum veri (tum aylar) kullanilir. Sonuc, `Sapma Oranı (%)`'na gore azalan sirada
     doner - boylece tahmin hatasinin/sapmanin en yuksek oldugu talep tipi ilk satirdan
     okunabilir.
@@ -2819,12 +3180,24 @@ def process_sprint_report(file_path: str | Path, target_month: str | None = None
 
     resolved_month = target_month or latest_month_label(df)
 
+    # `kpis`/`summary` HEDEF AYA gore hesaplanir - `planned_issues`/
+    # `out_of_plan_issues` zaten o aya filtreli oldugundan, ayni ciktinin ust
+    # (ozet) ve alt (liste) yarisi AYNI kart kumesini anlatmalidir. Eskiden bu iki
+    # deger tum veri uzerinden hesaplaniyordu; sonuc olarak PDF'in KPI kutulari ve
+    # MCP'nin `analyze_sprint` araci "Temmuz" derken 1229 kartin tamamina ait
+    # rakamlari (orn. 7688 SP) bildiriyordu.
+    #
+    # `data` ve `monthly_history` KASITLI olarak tum veriyi kullanmaya devam eder:
+    # ilki dashboard'un kendi filtrelerini uygulayabilmesi, ikincisi ise aylar
+    # arasi karsilastirma yapabilmesi icin gereklidir.
+    month_df = filter_by_month(df, resolved_month) if resolved_month else df
+
     return {
         "data": df,
         "planned_issues": build_planned_issues_table(df, target_month=resolved_month),
         "out_of_plan_issues": build_out_of_plan_issues_table(df, target_month=resolved_month),
-        "kpis": calculate_sprint_kpis(df),
-        "summary": summarize_metrics(df),
+        "kpis": calculate_sprint_kpis(month_df),
+        "summary": summarize_metrics(month_df),
         "monthly_history": build_yearly_monthly_history(df, target_month=resolved_month),
         "target_month": resolved_month,
     }

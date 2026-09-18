@@ -35,6 +35,7 @@ from processor import (  # noqa: E402
     analyze_advanced_bottlenecks,
     analyze_estimation_accuracy,
     analyze_projects_by_subject,
+    build_month_sprint_labels,
     build_monthly_history,
     build_out_of_plan_issues_table,
     build_planned_issues_table,
@@ -45,6 +46,7 @@ from processor import (  # noqa: E402
     compare_yearly_sprints,
     detect_recurring_bottlenecks,
     discover_jira_fields,
+    drop_duplicate_rows,
     explode_by_role,
     fetch_issues_from_jira_api,
     filter_by_month,
@@ -60,6 +62,21 @@ from processor import (  # noqa: E402
     run_core_5_kpi_analyses,
     search_issues_by_query,
     standardize_dataframe,
+)
+from share_report import (  # noqa: E402
+    ShareBullet,
+    ShareDocument,
+    ShareSection,
+    render_share_html,
+    render_share_text,
+)
+from weekly_report import (  # noqa: E402
+    WeeklyReportError,
+    analyze_week,
+    available_weeks,
+    build_share_document as build_weekly_share_document,
+    finding_sentence as weekly_finding_sentence,
+    week_label,
 )
 from config import env_snippet, load_jira_config  # noqa: E402
 from pdf_reporter import PdfFontError, create_pdf_report  # noqa: E402
@@ -91,6 +108,16 @@ STATUS_ICON = {"good": "🟢", "warning": "🟡", "serious": "🟠", "critical":
 
 ACCENT = CATEGORICAL["blue"]
 GRID_COLOR = "rgba(127, 127, 127, 0.25)"
+
+# Haftalık Özet sayfası - bulgu şiddetinin renk karşılıkları ve hafta seçicide
+# gösterilecek en fazla hafta sayısı.
+WEEKLY_SEVERITY_RENK = {
+    "kritik": STATUS["critical"],
+    "dikkat": STATUS["serious"],
+    "iyi": STATUS["good"],
+    "notr": CATEGORICAL["blue"],
+}
+WEEKLY_SELECTABLE_WEEKS = 12
 # Kart zemin/kenarlığı, notr griden Türkcell lacivertine (#002395) çok hafif
 # kaydırıldı - .streamlit/config.toml'daki sayfa arka planıyla (kayık sarı/lacivert
 # tonlar) tutarlı, marka hissi veren ama okunabilirliği bozmayan bir doku için.
@@ -349,13 +376,25 @@ MCP_TOOL_CATALOG: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+# Sayfalar ADIYLA referans verilir (`page == PAGE_EKIP`), indeksle DEĞİL: araya
+# yeni bir sayfa eklendiğinde tüm indekslerin kayması, sessizce yanlış sayfanın
+# açılmasına yol açardı.
+PAGE_GENEL = "🏠 Genel Bakış"
+PAGE_HAFTALIK = "🗓️ Haftalık Özet"
+PAGE_EKIP = "👥 Ekip & Kişiler"
+PAGE_PROJE = "📁 Proje & Konu"
+PAGE_AKIS = "🚧 Akış & Darboğazlar"
+PAGE_ASISTAN = "💬 Akıllı Asistan"
+PAGE_RAPOR = "📤 Rapor Merkezi"
+
 NAV_PAGES = [
-    "🏠 Genel Bakış",
-    "👥 Ekip & Kişiler",
-    "📁 Proje & Konu",
-    "🚧 Akış & Darboğazlar",
-    "💬 Akıllı Asistan",
-    "📤 Rapor Merkezi",
+    PAGE_GENEL,
+    PAGE_HAFTALIK,
+    PAGE_EKIP,
+    PAGE_PROJE,
+    PAGE_AKIS,
+    PAGE_ASISTAN,
+    PAGE_RAPOR,
 ]
 
 # --------------------------------------------------------------------------
@@ -795,12 +834,17 @@ def _metrics_by_role(df: pd.DataFrame, role: str, target_month: str | None) -> p
         combined = explode_by_role(df, role_column, fallback_to_assignee=False)
 
     combined = combined.loc[combined["person"].astype(str).str.strip() != ""]
-    role_scoped = (
-        combined.drop(columns=["assignee", "developers", "analysts"], errors="ignore")
-        .rename(columns={"person": "assignee"})
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
+    role_scoped = combined.drop(
+        columns=["assignee", "developers", "analysts"], errors="ignore"
+    ).rename(columns={"person": "assignee"})
+
+    # Düz `drop_duplicates()` burada KULLANILAMAZ: standardize edilmiş veride
+    # `sprint`/`sprint_months` liste tutar ve pandas listeyi hash'leyemez
+    # ("TypeError: unhashable type: 'list'"). `drop_duplicate_rows` bu kolonları
+    # anahtardan çıkarır ama SİLMEZ - `sprint_months` silinseydi aşağıdaki
+    # `calculate_assignee_metrics -> filter_by_month` zinciri ay atamasını sprint
+    # yerine sessizce `created` tarihinden yapardı.
+    role_scoped = drop_duplicate_rows(role_scoped).reset_index(drop=True)
     return calculate_assignee_metrics(role_scoped, target_month=target_month)
 
 
@@ -888,6 +932,103 @@ def _generate_excel_report(file_bytes: bytes, file_name: str, target_month: str 
         "out_of_plan_preview_df": result["out_of_plan_issues"],
         "planned_export_df": planned[export_columns],
         "out_of_plan_export_df": out_of_plan[export_columns],
+    }
+
+
+def _render_share_block(doc: ShareDocument, dosya_koku: str) -> None:
+    """Bir sayfanın altına standart "Paylaş" bölümünü çizer: e-postaya
+    yapıştırılabilir HTML indirme, düz metin indirme ve ekranda kopyalanabilir
+    metin.
+
+    TÜM sayfalarda aynı bileşen kullanılır; böylece kaçış (escape), tablo kırpma
+    ve e-posta uyumluluk kuralları tek yerde (`src/share_report.py`) tanımlı
+    kalır - sayfa başına ayrı bir HTML üreticisi yazılsaydı biri güncellenip
+    diğerleri unutulduğunda sayfalar sessizce farklı davranırdı.
+
+    `dosya_koku` indirilen dosyaların adında kullanılır; boşluklar ve Türkçe
+    karakterler dosya adı güvenli hale getirilir.
+    """
+    metin = render_share_text(doc)
+    html_govde = render_share_html(doc)
+
+    guvenli = (
+        dosya_koku.translate(str.maketrans("çğıöşüÇĞİÖŞÜ ", "cgiosuCGIOSU_"))
+        .replace("/", "-")
+        .replace("\\", "-")
+    )
+
+    st.divider()
+    _section("Paylaş", "E-postaya yapıştırılabilir tek parça HTML ya da düz metin")
+    html_col, metin_col = st.columns(2)
+    with html_col:
+        st.download_button(
+            "⬇️ HTML olarak indir",
+            data=html_govde.encode("utf-8"),
+            file_name=f"{guvenli}.html",
+            mime="text/html",
+            width="stretch",
+            key=f"share_html_{guvenli}",
+        )
+    with metin_col:
+        st.download_button(
+            "⬇️ Düz metin olarak indir",
+            data=metin.encode("utf-8"),
+            file_name=f"{guvenli}.txt",
+            mime="text/plain",
+            width="stretch",
+            key=f"share_txt_{guvenli}",
+        )
+    with st.expander("Metni ekranda göster (kopyalamak için)"):
+        st.code(metin, language=None)
+
+
+def _share_table(df: pd.DataFrame | None, index_adi: str | None = None) -> pd.DataFrame | None:
+    """Ekrandaki bir tabloyu paylaşıma uygun hale getirir.
+
+    Panelde `hide_index=True` ile gösterilen tablolarda indeks zaten taşınmaz;
+    ancak `compare_yearly_sprints` gibi metriklerin İNDEKSTE tutulduğu
+    tablolarda indeks atılırsa satırların ne anlama geldiği kaybolur - bu yüzden
+    `index_adi` verildiğinde indeks normal bir kolona çevrilir."""
+    if df is None or df.empty:
+        return None
+    if index_adi:
+        return df.reset_index().rename(columns={df.index.name or "index": index_adi})
+    return df
+
+
+def _scope_suffix() -> str:
+    """Paylaşılan belgenin alt başlığında kullanılacak kapsam metni - hangi
+    iterasyon/kişi/proje filtresiyle üretildiği çıktıdan anlaşılsın diye."""
+    parcalar = [selected_scope_label or "Tüm İterasyonlar"]
+    if selected_assignee:
+        parcalar.append(f"Kişi: {selected_assignee}")
+    if selected_project:
+        parcalar.append(f"Proje: {selected_project}")
+    return "  •  ".join(parcalar)
+
+
+@st.cache_data(show_spinner="Haftalık özet hazırlanıyor...")
+def _generate_weekly_report(
+    file_bytes: bytes, file_name: str, week_start: pd.Timestamp
+) -> dict:
+    """Secili hafta icin kural tabanli sprint ici performans ozetini uretir.
+
+    Bulgular ve iki ayri gosterim (duz metin / e-postalanabilir HTML) TEK bir
+    `analyze_week` cagrisindan turetilir; boylece ekranda gorulen, indirilen
+    metin ve HTML her zaman AYNI olcumu anlatir.
+
+    `@st.cache_data`, dosya + hafta ikilisi degismedigi surece yeniden hesaplama
+    yapmaz. `WeeklyFinding` nesneleri dondugu icin cagiran taraf severity'ye gore
+    renklendirme yapabilir.
+    """
+    result = analyze_week(_load_and_standardize(file_bytes, file_name), week_start=week_start)
+    return {
+        "bulgular": result["bulgular"],
+        "metrikler": result["metrikler"],
+        "veri_notu": result["veri_notu"],
+        # Paylasim belgesi burada uretilir; ekrandaki kartlar, indirilen HTML ve
+        # metin boylece TEK bir olcumden turer.
+        "belge": build_weekly_share_document(result),
     }
 
 
@@ -1247,13 +1388,41 @@ with st.sidebar:
     st.divider()
     st.caption("FİLTRELER")
 
+    # Ay listesi kartların SPRINT alanından türetilir (sprint adı çözülemeyen
+    # kartlarda `created` tarihine düşülür) - bkz. processor._row_month_keys.
+    # Kullanıcıya "Temmuz 2026" yerine Jira'da GÖRDÜĞÜ sprint adı gösterilir;
+    # filtreye giden değer yine ay etiketidir, böylece tüm alt ekranlar (KPI'lar,
+    # tablolar, trend, rapor indirme) değişmeden çalışır.
     all_months = [label for label, _ in build_monthly_history(df, last_n_months=None)]
-    month_options = list(reversed(all_months))
-    if month_options:
-        selected_month: str | None = st.selectbox("Ay", month_options, index=0)
+    sprint_names_by_month = build_month_sprint_labels(df)
+
+    def _scope_label(month: str) -> str:
+        names = sprint_names_by_month.get(month, [])
+        if not names:
+            # Bu aya sadece `created` tarihinden düşen kartlarla ulaşıldı -
+            # kullanıcının sprint adı beklediği yerde onu yanıltmamak için açıkça yazılır.
+            return f"{month} (sprintsiz)"
+        if len(names) == 1:
+            return names[0]
+        return f"{month} ({len(names)} sprint)"
+
+    month_by_scope_label: dict[str, str] = {}
+    for month in reversed(all_months):  # en güncel ay en üstte
+        month_by_scope_label.setdefault(_scope_label(month), month)
+
+    scope_options = list(month_by_scope_label)
+    if scope_options:
+        selected_scope_label: str | None = st.selectbox("İterasyon / Sprint", scope_options, index=0)
+        selected_month: str | None = month_by_scope_label[selected_scope_label]
+        if selected_scope_label != selected_month:
+            st.caption(f"Ay karşılığı: {selected_month}")
     else:
+        selected_scope_label = None
         selected_month = None
-        st.warning("Veride 'Created' tarihi bulunamadı; ay filtresi uygulanamıyor.")
+        st.warning(
+            "Veride ne 'Sprint' alanı ne de 'Created' tarihi bulunabildi; "
+            "iterasyon filtresi uygulanamıyor."
+        )
 
     # "Kişi" filtresi, sadece atanan (assignee) değil, kartların Developer/Analist
     # alanlarında geçen herkesi de kapsar - bkz. `standardize_dataframe`'in
@@ -1281,7 +1450,7 @@ with st.sidebar:
 
     st.divider()
     st.metric("Toplam Kart Sayısı", len(df))
-    st.caption(f"Kapsam: {selected_month or 'Tüm Aylar'} · {selected_assignee_label}")
+    st.caption(f"Kapsam: {selected_scope_label or 'Tüm İterasyonlar'} · {selected_assignee_label}")
 
 # Sidebar'daki secimlere gore aktif kapsam. "Kişi" filtresi assignee_options'daki
 # genisletilmis listeyle (assignee+developers+analysts) tutarli olmasi icin
@@ -1307,7 +1476,7 @@ with hero_cols[1]:
 with hero_cols[2]:
     _tile("Ay Sayısı", str(len(all_months)))
 with hero_cols[3]:
-    _tile("Aktif Kapsam", selected_month or "Tüm Aylar", accent=CATEGORICAL["orange"])
+    _tile("Aktif Kapsam", selected_scope_label or "Tüm İterasyonlar", accent=CATEGORICAL["orange"])
 
 st.write("")
 
@@ -1315,7 +1484,7 @@ st.write("")
 # Sayfa: Genel Bakış
 # --------------------------------------------------------------------------
 
-if page == NAV_PAGES[0]:
+if page == PAGE_GENEL:
     arama_sorgusu = st.text_input("🔍 Kart ara (talep tipi/özet/sorumlu/statü/etiket)")
     if arama_sorgusu:
         arama_sonucu = search_issues_by_query(df_scope, arama_sorgusu, target_month=selected_month)
@@ -1532,11 +1701,135 @@ if page == NAV_PAGES[0]:
             st.plotly_chart(fig, width="stretch", theme="streamlit")
         st.dataframe(estimation_df, width="stretch", hide_index=True)
 
+    _velocity = kpi5["1_velocity_predictability"]
+    _scope = kpi5["2_scope_stability"]
+    _flow = kpi5["4_flow_efficiency"]
+    _render_share_block(
+        ShareDocument(
+            baslik="Sprint & KPI Genel Bakış",
+            alt_baslik=_scope_suffix(),
+            kutular=[
+                ("Taahhüt Edilen SP", f"{kpis.committed_sp:.0f}"),
+                ("Gerçekleşen SP", f"{kpis.completed_sp:.0f}"),
+                ("Tamamlanma Oranı", f"%{kpis.completion_rate:.1f}"),
+                ("Plan Dışı Oranı", f"%{kpis.out_of_plan_rate:.1f}"),
+            ],
+            bolumler=[
+                ShareSection(
+                    baslik="5 Temel KPI",
+                    bullets=[
+                        ShareBullet(
+                            f"Velocity: taahhüt {_velocity['taahhut_edilen_sp']:.0f} SP, "
+                            f"gerçekleşen {_velocity['gerceklesen_sp']:.0f} SP "
+                            f"(tamamlanma %{_velocity['tamamlanma_orani_yuzde']:.1f})."
+                        ),
+                        ShareBullet(
+                            f"Scope Stability: plan dışı iş toplam yükün "
+                            f"%{_scope['scope_creep_orani_yuzde']:.1f} kadarı "
+                            f"({_scope['plan_disi_sp']:.0f} SP)."
+                        ),
+                        ShareBullet(
+                            f"Flow Efficiency: {_flow['aktif_is_sayisi']} aktif iş, "
+                            f"toplam {_flow['toplam_aktif_sp']:.0f} SP."
+                        ),
+                    ],
+                ),
+                ShareSection(baslik="İterasyon Bazlı İş Büyüklüğü (SP)", tablo=_share_table(trend_df, index_adi="Metrik")),
+                ShareSection(baslik="Talep Tipi Bazlı Tahmin Doğruluğu", tablo=estimation_df),
+            ],
+        ),
+        f"genel_bakis_{selected_month or 'tum_aylar'}",
+    )
+
+# --------------------------------------------------------------------------
+# Sayfa: Haftalık Özet
+# --------------------------------------------------------------------------
+# Ay/sprint KAPANIŞI raporlarının aksine bu sayfa sprint DEVAM EDERKEN gidişatı
+# değerlendirir. Metni kural tabanlı üretir (LLM yok) - bkz. src/weekly_report.py.
+
+elif page == PAGE_HAFTALIK:
+    _section(
+        "Haftalık Sprint İçi Performans",
+        "Seçili haftada ne tamamlandı, tempo nasıl, sprint hedefine yetişiliyor mu",
+    )
+
+    try:
+        haftalar = available_weeks(df_scope, last_n=WEEKLY_SELECTABLE_WEEKS)
+    except WeeklyReportError as exc:
+        # `last_transition` alanı yoksa/boşsa yanıltıcı bir "0 iş" raporu
+        # üretmek yerine durum açıkça anlatılır.
+        haftalar = []
+        st.warning(str(exc))
+
+    if haftalar:
+        secili_hafta = st.selectbox(
+            "Hafta",
+            haftalar,
+            index=0,
+            format_func=week_label,
+            help="Varsayılan: veride hareket bulunan en son hafta.",
+        )
+        rapor = _generate_weekly_report(file_bytes, file_name, pd.Timestamp(secili_hafta))
+        metrikler = rapor["metrikler"]
+
+        h1, h2, h3, h4 = st.columns(4)
+        with h1:
+            _tile("Tamamlanan İş", f"{metrikler.get('tamamlanan_kart', 0)}")
+        with h2:
+            _tile("Tamamlanan SP", f"{metrikler.get('tamamlanan_sp', 0):.0f}")
+        with h3:
+            _tile("Hareket Eden Kart", f"{metrikler.get('hareket_eden_kart', 0)}")
+        with h4:
+            _tile(
+                "Sprint İlerlemesi",
+                f"%{metrikler.get('sprint_ilerleme_yuzde', 0):.0f}",
+                caption=metrikler.get("sprint"),
+                accent=CATEGORICAL["orange"],
+            )
+
+        st.divider()
+        _section("Değerlendirme", "Kural tabanlı; her bulgu tek cümlede özetlenir")
+        for bulgu in rapor["bulgular"]:
+            renk = WEEKLY_SEVERITY_RENK.get(bulgu.severity, ACCENT)
+            st.markdown(
+                f'<div style="border-left:4px solid {renk};background:{CARD_BG};'
+                f'padding:10px 14px;border-radius:6px;margin-bottom:8px;">'
+                f'<strong style="color:{renk};">{bulgu.baslik}</strong><br>'
+                f"{weekly_finding_sentence(bulgu)}</div>",
+                unsafe_allow_html=True,
+            )
+        st.caption(rapor["veri_notu"])
+
+        st.divider()
+        _section("Haftalık Tamamlanan SP", "Seçili hafta ve öncesindeki referans haftalar")
+        gecmis = list(reversed(metrikler.get("gecmis_haftalar_sp", [])))
+        seri_etiket = [
+            week_label(pd.Timestamp(secili_hafta) - pd.Timedelta(7 * i, "D"))
+            for i in range(len(gecmis), -1, -1)
+        ]
+        seri_deger = gecmis + [metrikler.get("tamamlanan_sp", 0.0)]
+        fig = go.Figure()
+        fig.add_bar(
+            x=seri_etiket,
+            y=seri_deger,
+            marker_color=[CATEGORICAL["blue"]] * len(gecmis) + [CATEGORICAL["orange"]],
+            text=[f"{v:.0f}" for v in seri_deger],
+            textposition="outside",
+            hovertemplate="%{x}<br>%{y:.0f} SP<extra></extra>",
+        )
+        _apply_chart_chrome(fig, height=300, yaxis_title="Tamamlanan SP")
+        fig.update_xaxes(gridcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, width="stretch", theme="streamlit")
+
+        _render_share_block(
+            rapor["belge"], f"haftalik_ozet_{pd.Timestamp(secili_hafta):%Y-%m-%d}"
+        )
+
 # --------------------------------------------------------------------------
 # Sayfa: Ekip & Kişiler
 # --------------------------------------------------------------------------
 
-elif page == NAV_PAGES[1]:
+elif page == PAGE_EKIP:
     # "Toplam İş Sayısı (Ekip)"/"En Yüklü Kişi" ozet kartlari, asagidaki "Rol"
     # secicisinden BAGIMSIZ olarak HER ZAMAN "Hepsi" (Assignee+Developer+Analist
     # birlesimi, ayni karttaki ayni kisi bir kez sayilir) gorunumunu kullanir -
@@ -1643,11 +1936,46 @@ elif page == NAV_PAGES[1]:
     else:
         st.info("Kişi bazlı detay görmek için soldaki menüden bir kişi seçin.")
 
+    _ekip_bulgular = []
+    if not metrics.empty:
+        _en_yuklu = metrics.iloc[0]
+        _ortalama = float(metrics["Toplam Yük (SP)"].mean())
+        _ekip_bulgular.append(
+            ShareBullet(
+                f"Ekipte {len(metrics)} kişi var; toplam "
+                f"{int(metrics['Toplam İş Sayısı'].sum()):,} iş kayıtlı."
+            )
+        )
+        _ekip_bulgular.append(
+            ShareBullet(
+                f"En yüklü kişi {_en_yuklu['Sorumlu']} ({_en_yuklu['Toplam Yük (SP)']:.0f} SP); "
+                f"kişi başına ortalama {_ortalama:.0f} SP."
+            )
+        )
+    _render_share_block(
+        ShareDocument(
+            baslik="Ekip & Kişiler",
+            alt_baslik=_scope_suffix(),
+            kutular=[
+                ("Ekipteki Kişi", str(len(metrics))),
+                ("Toplam İş", f"{int(metrics['Toplam İş Sayısı'].sum()):,}" if not metrics.empty else "0"),
+                ("Toplam Yük (SP)", f"{metrics['Toplam Yük (SP)'].sum():.0f}" if not metrics.empty else "0"),
+            ],
+            bolumler=[
+                ShareSection(baslik="Özet", bullets=_ekip_bulgular),
+                ShareSection(
+                    baslik=f"Kişi Bazlı İş Yükü ({selected_role})", tablo=_share_table(role_metrics)
+                ),
+            ],
+        ),
+        f"ekip_kisiler_{selected_month or 'tum_aylar'}",
+    )
+
 # --------------------------------------------------------------------------
 # Sayfa: Proje & Konu
 # --------------------------------------------------------------------------
 
-elif page == NAV_PAGES[2]:
+elif page == PAGE_PROJE:
     proje_df = analyze_projects_by_subject(df_scope, target_month=selected_month)
 
     pt1, pt2 = st.columns(2)
@@ -1721,11 +2049,60 @@ elif page == NAV_PAGES[2]:
             hide_index=True,
         )
 
+    _proje_bulgular = []
+    if not proje_df.empty:
+        _en_buyuk = proje_df.iloc[0]
+        _proje_bulgular.append(
+            ShareBullet(
+                f"{len(proje_df)} konu/bileşen içinde en büyük yük "
+                f"\"{_en_buyuk['Proje/Konu']}\" ({_en_buyuk['Toplam SP']:.0f} SP, "
+                f"tamamlanma %{_en_buyuk['Tamamlanma Oranı (%)']:.0f})."
+            )
+        )
+        _dusuk = proje_df.loc[proje_df["Tamamlanma Oranı (%)"] < 50]
+        if not _dusuk.empty:
+            _proje_bulgular.append(
+                ShareBullet(
+                    f"Tamamlanma oranı %50'nin altında olan {len(_dusuk)} konu var: "
+                    + ", ".join(_dusuk["Proje/Konu"].head(3).astype(str)),
+                    severity="dikkat",
+                )
+            )
+    _render_share_block(
+        ShareDocument(
+            baslik="Proje & Konu Analizi",
+            alt_baslik=_scope_suffix(),
+            kutular=[
+                ("Konu Sayısı", str(len(proje_df))),
+                ("Toplam SP", f"{proje_df['Toplam SP'].sum():.0f}" if not proje_df.empty else "0"),
+                (
+                    "Tamamlanan SP",
+                    f"{proje_df['Tamamlanan SP'].sum():.0f}" if not proje_df.empty else "0",
+                ),
+            ],
+            bolumler=[
+                ShareSection(baslik="Özet", bullets=_proje_bulgular),
+                ShareSection(baslik="Proje / Konu Bazlı Dağılım", tablo=_share_table(proje_df)),
+                ShareSection(
+                    baslik="Planlanan İşler",
+                    tablo=_share_table(build_planned_issues_table(df_scope, target_month=selected_month)),
+                ),
+                ShareSection(
+                    baslik="Plan Dışı İşler",
+                    tablo=_share_table(
+                        build_out_of_plan_issues_table(df_scope, target_month=selected_month)
+                    ),
+                ),
+            ],
+        ),
+        f"proje_konu_{selected_month or 'tum_aylar'}",
+    )
+
 # --------------------------------------------------------------------------
 # Sayfa: Akış & Darboğazlar
 # --------------------------------------------------------------------------
 
-elif page == NAV_PAGES[3]:
+elif page == PAGE_AKIS:
     _section(
         "Ham Statü Dağılımı",
         "Jira'nın ham statü alanına göre kart dağılımı",
@@ -2064,11 +2441,60 @@ elif page == NAV_PAGES[3]:
             wip_fig.update_yaxes(title_text="Ortalama Yaş (gün)", secondary_y=True, gridcolor="rgba(0,0,0,0)")
             st.plotly_chart(wip_fig, width="stretch", theme="streamlit")
 
+    _render_share_block(
+        ShareDocument(
+            baslik="Akış & Darboğaz Analizi",
+            alt_baslik=_scope_suffix(),
+            kutular=[
+                ("Aktif İş", str(wip["aktif_is_sayisi"])),
+                ("Ortalama Yaş", f"{wip['ortalama_yas_gun']:.1f} gün"),
+                ("Tıkanan İş Oranı", f"%{blocker['tikali_is_orani_yuzde']:.1f}"),
+                ("Reopen Oranı", f"%{reopen['reopen_orani_yuzde']:.1f}"),
+            ],
+            bolumler=[
+                ShareSection(
+                    baslik="Süreç Kaybı Özeti",
+                    bullets=[
+                        ShareBullet(
+                            f"WIP Aging: {wip['aktif_is_sayisi']} aktif işin ortalama açık kalma süresi "
+                            f"{wip['ortalama_yas_gun']:.1f} gün; {wip['onceki_ay']['is_sayisi']} tanesi "
+                            f"önceki aydan, {wip['alti_aylik']['is_sayisi']} tanesi 6+ aydır açık."
+                        ),
+                        ShareBullet(
+                            f"Blocker & Hold: işlerin %{blocker['tikali_is_orani_yuzde']:.1f} kadarı tıkanmış, "
+                            f"bu {blocker['tikali_sp']:.0f} SP'lik kapasite kaybı demek.",
+                            severity="dikkat" if blocker["tikali_is_orani_yuzde"] >= 10 else None,
+                        ),
+                        ShareBullet(
+                            f"Yük yoğunlaşması: en yüklü %20'lik dilim toplam yükün "
+                            f"%{bouncing['yogunlasma_orani_yuzde']:.1f} kadarını taşıyor "
+                            f"(en yüklü: {bouncing['en_yuklu_kisi'] or '—'})."
+                        ),
+                        ShareBullet(
+                            f"Reopen/takılma: %{reopen['reopen_orani_yuzde']:.1f} "
+                            f"({reopen['yontem']} yöntemiyle tahmin edildi)."
+                        ),
+                    ],
+                ),
+                ShareSection(baslik="Ham Statü Dağılımı", tablo=_share_table(status_df)),
+                ShareSection(
+                    baslik="Devam Eden Darboğazlar (İsim Bazlı)", tablo=_share_table(recurring_df)
+                ),
+                ShareSection(
+                    baslik="Tıkanan İşler",
+                    tablo=_share_table(blocker["tikali_isler"]),
+                ),
+            ],
+            dipnot=reopen.get("aciklama", ""),
+        ),
+        f"akis_darbogaz_{selected_month or 'tum_aylar'}",
+    )
+
 # --------------------------------------------------------------------------
 # Sayfa: Akıllı Asistan
 # --------------------------------------------------------------------------
 
-elif page == NAV_PAGES[4]:
+elif page == PAGE_ASISTAN:
     if WATERMARK_URI:
         # SADECE bu sayfada aktif: gercek gorsel tam opaklikta arka plana konur,
         # ustune neredeyse opak bir katman (::before) binuir - boylece sadece
@@ -2211,15 +2637,15 @@ elif page == NAV_PAGES[4]:
 # Sayfa: Rapor Merkezi
 # --------------------------------------------------------------------------
 
-elif page == NAV_PAGES[5]:
+elif page == PAGE_RAPOR:
     _section(
         "Rapor Merkezi",
         "Biçimlendirilmiş, grafikli Excel raporunu oluşturun, ekranda önizleyin ve seçili kartları ayrıca indirin",
     )
     st.write(
-        f"Seçili kapsam: **{selected_month or 'Tüm Aylar'}** ay filtresiyle, tüm ekip için "
-        "biçimlendirilmiş bir Excel raporu oluşturulur (grafikli özet + planlanan/plan dışı "
-        "iş listeleri)."
+        f"Seçili kapsam: **{selected_scope_label or 'Tüm İterasyonlar'}** iterasyon filtresiyle, "
+        "tüm ekip için biçimlendirilmiş bir Excel raporu oluşturulur (grafikli özet + "
+        "planlanan/plan dışı iş listeleri)."
     )
 
     dosya_ay = (selected_month or "tum_aylar").replace(" ", "_")
