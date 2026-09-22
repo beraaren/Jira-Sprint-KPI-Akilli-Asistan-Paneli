@@ -83,6 +83,7 @@ class JiraConfig:
     skip_ssl: bool
     field_id_map: dict[str, str | None]
     auto_connect: bool
+    sprint_disi_fallback_enabled: bool
 
     @property
     def has_credentials(self) -> bool:
@@ -107,7 +108,8 @@ class JiraConfig:
             f"JiraConfig(base_url={self.base_url!r}, token={masked}, "
             f"project_key={self.project_key!r}, months_back={self.months_back}, "
             f"skip_ssl={self.skip_ssl}, field_id_map={self.field_id_map!r}, "
-            f"auto_connect={self.auto_connect})"
+            f"auto_connect={self.auto_connect}, "
+            f"sprint_disi_fallback_enabled={self.sprint_disi_fallback_enabled})"
         )
 
 
@@ -123,7 +125,17 @@ def load_jira_config() -> JiraConfig:
         skip_ssl=_get_bool("JIRA_SKIP_SSL", False),
         field_id_map={key: (_get(env_key) or None) for key, env_key in _FIELD_ENV_KEYS.items()},
         auto_connect=_get_bool("JIRA_AUTO_CONNECT", False),
+        sprint_disi_fallback_enabled=_get_bool("SPRINT_DISI_FALLBACK_ENABLED", False),
     )
+
+
+def sprint_disi_fallback_enabled() -> bool:
+    """Created-tarihi tabanli plan-disi yedegi o anda etkin mi?
+
+    Degeri her cagrida okumak testlerin ve uzun sure acik kalan panel surecinin
+    ortam degiskeni degisikligini yeniden baslatmadan gorebilmesini saglar.
+    """
+    return _get_bool("SPRINT_DISI_FALLBACK_ENABLED", False)
 
 
 def env_snippet(base_url: str, project_key: str, field_id_map: dict[str, str | None]) -> str:
@@ -139,6 +151,7 @@ def env_snippet(base_url: str, project_key: str, field_id_map: dict[str, str | N
         f"JIRA_BASE_URL={base_url}",
         "JIRA_PAT=<kendi token'ınız>",
         f"JIRA_PROJECT_KEY={project_key}",
+        "SPRINT_DISI_FALLBACK_ENABLED=false",
     ]
     for key, env_key in _FIELD_ENV_KEYS.items():
         lines.append(f"{env_key}={field_id_map.get(key) or ''}")

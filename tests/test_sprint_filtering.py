@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import pandas as pd
@@ -22,6 +23,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from processor import (  # noqa: E402
+    analyze_carried_over_issues,
     build_month_sprint_labels,
     build_planned_issues_table,
     build_sprint_period_map,
@@ -30,6 +32,8 @@ from processor import (  # noqa: E402
     drop_duplicate_rows,
     explode_by_role,
     filter_by_month,
+    filter_out_of_plan_issues,
+    filter_planned_issues,
     latest_month_label,
     standardize_dataframe,
 )
@@ -207,6 +211,56 @@ class CreatedFallbackTests(unittest.TestCase):
         df = _frame([_raw_row("Kart", "15-Jul-26 10:00", ["MS Sprint - Temmuz 26"])]).iloc[0:0]
         self.assertTrue(filter_by_month(df, "Temmuz 2026").empty)
         self.assertIsNone(latest_month_label(df))
+
+    def test_sprint_disi_fallback_env_ile_acilip_kapanir(self):
+        df = _frame([
+            _raw_row("Tolerans", "02-Jul-26 23:59", ["MS Sprint - Temmuz 26"]),
+            _raw_row("Sonradan gelen", "03-Jul-26 00:01", ["MS Sprint - Temmuz 26"]),
+            _raw_row("Etiketli", "01-Jul-26 00:01", ["MS Sprint - Temmuz 26"], labels="SprintDışı"),
+        ])
+        scoped = filter_by_month(df, "Temmuz 2026")
+
+        with patch.dict("os.environ", {"SPRINT_DISI_FALLBACK_ENABLED": "false"}):
+            self.assertEqual(list(filter_out_of_plan_issues(scoped)["summary"]), ["Etiketli"])
+        with patch.dict("os.environ", {"SPRINT_DISI_FALLBACK_ENABLED": "true"}):
+            self.assertEqual(
+                list(filter_out_of_plan_issues(scoped)["summary"]),
+                ["Sonradan gelen", "Etiketli"],
+            )
+            self.assertEqual(list(filter_planned_issues(scoped)["summary"]), ["Tolerans"])
+
+    def test_devreden_kart_yeni_sprintte_fallbacke_takilmaz(self):
+        df = _frame([
+            _raw_row("Devreden", "03-Mar-26 03:02", [
+                "MS Sprint - Mart 26", "MS Sprint - Temmuz 26",
+            ]),
+        ])
+        with patch.dict("os.environ", {"SPRINT_DISI_FALLBACK_ENABLED": "true"}):
+            self.assertEqual(len(filter_planned_issues(filter_by_month(df, "Temmuz 2026"))), 1)
+            self.assertEqual(len(filter_out_of_plan_issues(filter_by_month(df, "Mart 2026"))), 1)
+
+
+class CarriedOverIssueTests(unittest.TestCase):
+    def test_yalniz_onceki_sprint_uyeligi_olan_kartlari_listeler(self):
+        rows = [
+            _raw_row("Devreden aktif", "03-Mar-26 03:02", [
+                "MS Sprint - Mart 26", "MS Sprint - Temmuz 26",
+            ], sp=8.0, status="In Progress", assignee="Ada"),
+            _raw_row("Devreden tamam", "03-Apr-26 03:02", [
+                "MS Sprint - Nisan 26", "MS Sprint - Temmuz 26",
+            ], sp=5.0, status="Done", assignee="Ece"),
+            _raw_row("Yeni kart", "01-Jul-26 03:02", ["MS Sprint - Temmuz 26"], sp=3.0),
+        ]
+        rows[0]["Issue Key"] = "MS-1"
+        rows[1]["Issue Key"] = "MS-2"
+        result = analyze_carried_over_issues(_frame(rows), "Temmuz 2026")
+
+        self.assertEqual(result["toplam_kart"], 2)
+        self.assertEqual(result["toplam_sp"], 13.0)
+        self.assertEqual(result["devam_eden_kart"], 1)
+        self.assertEqual(result["tamamlanan_kart"], 1)
+        self.assertEqual(set(result["kartlar"]["Jira Kartı"]), {"MS-1", "MS-2"})
+        self.assertNotIn("Yeni kart", set(result["kartlar"]["İş Listesi"]))
 
 
 class MonthSprintLabelTests(unittest.TestCase):

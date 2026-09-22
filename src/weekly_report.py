@@ -50,8 +50,9 @@ from processor import (
     BURNOUT_LOAD_MULTIPLIER,
     MONTH_LABELS_TR,
     _is_done,
-    _is_sprint_disi,
     _month_label,
+    filter_planned_issues,
+    filter_out_of_plan_issues,
     filter_by_month,
     latest_month_label,
 )
@@ -325,7 +326,7 @@ def analyze_week(
         )
 
     # --- 3) Sprint ilerlemesi ------------------------------------------------
-    planli = sprint_df.loc[~_is_sprint_disi(sprint_df["labels"])]
+    planli = filter_planned_issues(sprint_df)
     taahhut_sp = float(planli["estimate"].sum())
     sprint_tamamlanan_sp = float(planli.loc[_is_done(planli["status"]), "estimate"].sum())
     ilerleme = (sprint_tamamlanan_sp / taahhut_sp * 100) if taahhut_sp else 0.0
@@ -455,7 +456,8 @@ def analyze_week(
         )
 
     # --- 8) Plan disi is -----------------------------------------------------
-    plan_disi_sp = float(tamamlanan.loc[_is_sprint_disi(tamamlanan["labels"]), "estimate"].sum())
+    tamamlanan_sprint = filter_by_month(tamamlanan, sprint_label)
+    plan_disi_sp = float(filter_out_of_plan_issues(tamamlanan_sprint)["estimate"].sum())
     metrikler["plan_disi_tamamlanan_sp"] = plan_disi_sp
     # Plan disi is YOKSA bulgu uretilmez - "0 SP (%0) plan disi geldi" satiri
     # ozeti uzatir ama hicbir sey soylemez.

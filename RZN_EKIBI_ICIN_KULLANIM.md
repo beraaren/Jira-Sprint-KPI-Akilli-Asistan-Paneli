@@ -73,7 +73,7 @@ Rapor iş listesini ikiye ayırır:
 | Sprint başında planlanan iş | *(etiket yok)* |
 | Sprint ortasında gelen, planlanmamış iş | **`SprintDışı`** |
 
-Etiket yoksa her şey "planlanan" sayılır ve *"plan dışı iş yükümüz ne kadar?"*
+Fallback kapalıyken etiket yoksa her şey "planlanan" sayılır ve *"plan dışı iş yükümüz ne kadar?"*
 sorusu cevapsız kalır. Yazım esnektir: `SprintDışı`, `SprintDisi`, `Sprint Dışı`
 hepsi tanınır.
 
@@ -198,7 +198,17 @@ bağlanır; hiçbir buluta veri gönderilmez.
 
 **Bir kart iki sprintte görünüyorsa iki kez mi sayılır?**
 Evet, yer aldığı her sprintin toplamına girer. Devreden işin her iterasyonda
-görünmesi kasıtlıdır.
+görünmesi kasıtlıdır. Akış & Darboğazlar sayfasındaki **Devreden İşler** paneli,
+seçili sprintteki bu kartları önceki sprintleri, statüleri, sorumluları ve SP
+değerleriyle ayrıca listeler. Bu, iş adı+sorumlu benzerliğine bakan **Devam Eden
+Darboğazlar (İsim Bazlı)** bölümünden farklıdır.
+
+**SprintDışı etiketi kullanılmayan ekiplerde ne olur?**
+`.env` içinde `SPRINT_DISI_FALLBACK_ENABLED=true` yapılırsa seçili sprint ayının
+ilk gününden bir tam gün sonra oluşturulan kartlar analiz sırasında plan dışı
+kabul edilir. Ayın ilk iki günü toleranstır; ayın 3'ü ve sonrası fallback'e
+girer. Bu sınıflandırma Jira kartını veya etiketlerini değiştirmez. Ayar `false`
+iken yalnızca mevcut `SprintDışı` etiketi kullanılır.
 
 **Sprint alanı boş kartlar ne olur?**
 Kaybolmazlar; açılma tarihinin ayına sayılırlar.

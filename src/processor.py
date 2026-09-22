@@ -17,12 +17,15 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from config import sprint_disi_fallback_enabled
+
 __all__ = [
     "SprintKPIs",
     "read_sprint_report",
     "standardize_dataframe",
     "filter_planned_issues",
     "filter_out_of_plan_issues",
+    "analyze_carried_over_issues",
     "calculate_sprint_kpis",
     "calculate_completion_rate",
     "build_planned_issues_table",
@@ -74,6 +77,7 @@ __all__ = [
 # Jira, ozel alanlari "Custom field (...)" ile sarmaladigindan bu varyasyonlar da
 # ayrica eklenmistir (orn. "Custom field (Story Points)").
 COLUMN_ALIASES: dict[str, list[str]] = {
+    "issue_key": ["issue key", "key", "jira key", "talep anahtari", "talep anahtarı"],
     "issue_type": ["issue type", "issuetype", "talep tipi", "is tipi"],
     "summary": ["summary", "is listesi", "özet", "ozet"],
     "labels": ["labels", "label", "etiket", "etiketler"],
@@ -700,6 +704,7 @@ def _jira_issue_to_row(
     labels = fields.get("labels") or []
 
     return {
+        "Issue Key": issue.get("key", "") or "",
         "Issue Type": issuetype.get("name", "") or "",
         "Summary": fields.get("summary", "") or "",
         "Status": status.get("name", "") or "",
@@ -1069,7 +1074,7 @@ def standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
         sprint_series, build_sprint_period_map(sprint_series.explode().dropna())
     )
 
-    for text_col in ("issue_type", "summary", "status", "labels", "assignee", "project", "component"):
+    for text_col in ("issue_key", "issue_type", "summary", "status", "labels", "assignee", "project", "component"):
         df[text_col] = df[text_col].fillna("").astype(str).str.strip()
 
     df["estimate"] = pd.to_numeric(df["estimate"], errors="coerce").fillna(0.0)
@@ -1085,8 +1090,52 @@ def standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 
-def _is_sprint_disi(labels: pd.Series) -> pd.Series:
-    return labels.astype(str).str.contains(SPRINT_DISI_PATTERN, na=False)
+def _fallback_sprint_disi_mask(df: pd.DataFrame) -> pd.Series:
+    """Secili sprint baslangicindan bir gun sonra olusturulan kartlari bulur.
+
+    Jira exportu gercek sprint startDate bilgisini tasimadigi icin sprint adindan
+    cozulmus takvim ayinin ilk gunu baslangic kabul edilir. Karsilastirma tarih
+    bazlidir: ayin ilk iki gunu tolerans, ayin 3'u ve sonrasi plan disidir.
+    Analiz ayi `filter_by_month` attribute'undan veya aylik hesaplamalardaki
+    `_period` kolonundan gelir; baglam yoksa guvenli bicimde fallback uygulanmaz.
+    """
+    mask = pd.Series(False, index=df.index, dtype=bool)
+    if not sprint_disi_fallback_enabled() or "created" not in df.columns or df.empty:
+        return mask
+
+    if "_period" in df.columns:
+        periods = df["_period"].map(
+            lambda value: value if isinstance(value, pd.Period) else pd.Period(value, freq="M")
+        )
+        starts = periods.map(lambda period: period.start_time)
+    else:
+        period_value = df.attrs.get("analysis_period")
+        if period_value is None:
+            return mask
+        period = (
+            period_value
+            if isinstance(period_value, pd.Period)
+            else pd.Period(period_value, freq="M")
+        )
+        starts = pd.Series(period.start_time, index=df.index)
+
+    created = pd.to_datetime(df["created"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    cutoff = pd.to_datetime(starts).dt.tz_localize(None).map(
+        lambda start: start + pd.DateOffset(days=1)
+    )
+    return created.notna() & (created > cutoff)
+
+
+def _is_sprint_disi(labels_or_df: pd.Series | pd.DataFrame) -> pd.Series:
+    """Label'i ve etkinse Created-tarihi fallback'ini birlikte degerlendirir."""
+    if isinstance(labels_or_df, pd.DataFrame):
+        labels = labels_or_df["labels"]
+        return (
+            labels.astype(str).str.contains(SPRINT_DISI_PATTERN, na=False)
+            | _fallback_sprint_disi_mask(labels_or_df)
+        )
+    # Geriye uyumluluk: yalniz Series verilen dahili/eski cagrilar label kontrolu yapar.
+    return labels_or_df.astype(str).str.contains(SPRINT_DISI_PATTERN, na=False)
 
 
 def _is_done(status: pd.Series) -> pd.Series:
@@ -1094,13 +1143,13 @@ def _is_done(status: pd.Series) -> pd.Series:
 
 
 def filter_planned_issues(df: pd.DataFrame) -> pd.DataFrame:
-    """Label'inda 'SprintDışı' gecmeyen (planlanan) kartlari doner."""
-    return df.loc[~_is_sprint_disi(df["labels"])].reset_index(drop=True)
+    """Label/fallback kuralina gore planlanan kartlari doner."""
+    return df.loc[~_is_sprint_disi(df)].reset_index(drop=True)
 
 
 def filter_out_of_plan_issues(df: pd.DataFrame) -> pd.DataFrame:
-    """Label'inda 'SprintDışı' gecen (plan disi) kartlari doner."""
-    return df.loc[_is_sprint_disi(df["labels"])].reset_index(drop=True)
+    """Label/fallback kuralina gore plan disi kartlari doner."""
+    return df.loc[_is_sprint_disi(df)].reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------
@@ -1661,7 +1710,74 @@ def filter_by_month(df: pd.DataFrame, target_month: str | None = None) -> pd.Dat
             return df.iloc[0:0]
         target_key = matching[-1]
 
-    return df.loc[row_keys.map(lambda keys: target_key in keys)].reset_index(drop=True)
+    result = df.loc[row_keys.map(lambda keys: target_key in keys)].reset_index(drop=True)
+    result.attrs["analysis_period"] = target_key
+    return result
+
+
+def analyze_carried_over_issues(
+    df: pd.DataFrame, target_month: str | None = None
+) -> dict:
+    """Secili sprintte olup daha eski bir sprintte de bulunan Jira kartlarini raporlar.
+
+    Bu analiz Created yasina veya benzer is adlarina bakmaz; Jira'nin coklu Sprint
+    alanindaki gercek uyelikleri kullanir. Boylece isim-bazli tekrarlayan darboğaz
+    analizinden bagimsizdir.
+    """
+    scoped = filter_by_month(df, target_month)
+    target_key = scoped.attrs.get("analysis_period")
+    empty = pd.DataFrame(columns=[
+        "Jira Kartı", "İş Listesi", "Önceki Sprintler", "Statü", "Sorumlu",
+        "Büyüklük (SP)", "Oluşturulma Tarihi",
+    ])
+    if scoped.empty or target_key is None or "sprint_months" not in scoped.columns:
+        return {"toplam_kart": 0, "toplam_sp": 0.0, "devam_eden_kart": 0,
+                "devam_eden_sp": 0.0, "tamamlanan_kart": 0, "tamamlanan_sp": 0.0,
+                "kartlar": empty}
+
+    target_period = pd.Period(target_key, freq="M")
+    period_map = build_sprint_period_map(scoped["sprint"].explode().dropna())
+
+    def _previous_months(values: object) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        return sorted({key for key in values if pd.Period(key, freq="M") < target_period})
+
+    previous_keys = scoped["sprint_months"].map(_previous_months)
+    carried = scoped.loc[previous_keys.map(bool)].copy()
+    carried_previous = previous_keys.loc[carried.index]
+    if carried.empty:
+        return {"toplam_kart": 0, "toplam_sp": 0.0, "devam_eden_kart": 0,
+                "devam_eden_sp": 0.0, "tamamlanan_kart": 0, "tamamlanan_sp": 0.0,
+                "kartlar": empty}
+
+    def _previous_labels(row: pd.Series) -> str:
+        allowed = set(carried_previous.loc[row.name])
+        labels = [
+            label for label in row["sprint"]
+            if label in period_map and str(period_map[label]) in allowed
+        ] if isinstance(row["sprint"], list) else []
+        return ", ".join(labels)
+
+    done = _is_done(carried["status"])
+    table = pd.DataFrame({
+        "Jira Kartı": carried["issue_key"].where(carried["issue_key"] != "", "—"),
+        "İş Listesi": carried["summary"],
+        "Önceki Sprintler": carried.apply(_previous_labels, axis=1),
+        "Statü": carried["status"],
+        "Sorumlu": carried["assignee"].where(carried["assignee"] != "", "—"),
+        "Büyüklük (SP)": carried["estimate"],
+        "Oluşturulma Tarihi": carried["created"].dt.strftime("%d-%m-%Y").fillna(""),
+    }).sort_values(["Statü", "Büyüklük (SP)"], ascending=[True, False]).reset_index(drop=True)
+    return {
+        "toplam_kart": int(len(carried)),
+        "toplam_sp": float(carried["estimate"].sum()),
+        "devam_eden_kart": int((~done).sum()),
+        "devam_eden_sp": float(carried.loc[~done, "estimate"].sum()),
+        "tamamlanan_kart": int(done.sum()),
+        "tamamlanan_sp": float(carried.loc[done, "estimate"].sum()),
+        "kartlar": table,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -2264,6 +2380,20 @@ def _monthly_committed_completed(
     }
 
 
+def _monthly_out_of_plan_completed(
+    df: pd.DataFrame, last_n_months: int | None, end_month: str | None
+) -> dict[str, tuple[float, float]]:
+    """Her ayi kendi sprint baglaminda siniflandirip plan-disi toplam/Done SP doner."""
+    dated, periods = _monthly_periods_window(df, last_n_months, end_month)
+    result: dict[str, tuple[float, float]] = {}
+    for period in periods:
+        month_df = dated.loc[dated["_period"] == period]
+        result[_month_label(period)] = _calculate_simple_committed_completed(
+            filter_out_of_plan_issues(month_df)
+        )
+    return result
+
+
 def _build_capacity_forecast(monthly_pairs: dict[str, tuple[float, float]], latest_month: str | None) -> dict:
     """`{ay_etiketi: (taahhut/toplam_sp, gerceklesen_sp)}` seklindeki bir aylik
     seriden `calculate_capacity_forecast`/`calculate_capacity_forecast_split`
@@ -2411,9 +2541,8 @@ def calculate_capacity_forecast_split(
     Her iki alt sonuç da `calculate_capacity_forecast` ile AYNI şema/alanlara sahiptir
     (bkz. o fonksiyonun docstring'i).
     """
-    out_of_plan_df = filter_out_of_plan_issues(df)
-    out_of_plan_pairs = _monthly_committed_completed(
-        out_of_plan_df, last_n_months=lookback_months + 1, end_month=target_month
+    out_of_plan_pairs = _monthly_out_of_plan_completed(
+        df, last_n_months=lookback_months + 1, end_month=target_month
     )
 
     return {
@@ -2421,7 +2550,7 @@ def calculate_capacity_forecast_split(
             df, target_month=target_month, lookback_months=lookback_months
         ),
         "out_of_plan_forecast": _build_capacity_forecast(
-            out_of_plan_pairs, latest_month_label(out_of_plan_df)
+            out_of_plan_pairs, latest_month_label(df)
         ),
     }
 

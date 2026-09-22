@@ -260,6 +260,12 @@ benzeyen tablo otomatik seçilir (HTML'de birden fazla tablo olması durumuyla
 aynı mantık). Kolon başlıkları Türkçe/İngilizce varyasyonlarıyla otomatik
 eşlenir (`Sorumlu`/`Assignee`, `Story Points`/`Estimate`/`Custom field (Story
 Points)`, `Oluşturulma Tarihi`/`Created`, `Project`/`Project name` vb.);
-zorunlu alanlar `issue_type`, `summary` ve `status`'tür. Plan dışı işler,
-`labels` alanında "SprintDışı" (yazım varyasyonlarından bağımsız) geçen
-kartlar olarak tespit edilir.
+zorunlu alanlar `issue_type`, `summary` ve `status`'tür. Plan dışı işler her
+zaman `labels` alanındaki "SprintDışı" etiketiyle (yazım varyasyonlarından
+bağımsız) tespit edilir. Ek olarak `SPRINT_DISI_FALLBACK_ENABLED=true` ise,
+seçili sprint ayının ilk gününden bir tam gün sonra oluşturulan etiketsiz
+kartlar da yalnızca analizde plan dışı kabul edilir; Jira'ya etiket yazılmaz.
+
+Akış & Darboğazlar sayfasındaki **Devreden İşler** paneli, seçili sprintte olup
+Jira Sprint alanında daha eski bir sprint üyeliği de bulunan kartları ayrı
+gösterir. Bu panel Created tarihine veya benzer iş adına göre tahmin yapmaz.

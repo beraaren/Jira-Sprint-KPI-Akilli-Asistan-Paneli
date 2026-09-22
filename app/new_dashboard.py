@@ -33,6 +33,7 @@ from processor import (  # noqa: E402
     JiraApiError,
     JiraSslError,
     analyze_advanced_bottlenecks,
+    analyze_carried_over_issues,
     analyze_estimation_accuracy,
     analyze_projects_by_subject,
     build_month_sprint_labels,
@@ -164,7 +165,7 @@ KPI_HELP: dict[str, str] = {
         "olması iş hacminin arttığını, düşük olması ekibin daha az iş aldığını gösterir."
     ),
     "taahhut_sp": (
-        "Ay içinde açılan, 'SprintDışı' etiketi taşımayan kartların Story Point (SP) "
+        "Seçili sprintte planlanan kabul edilen kartların Story Point (SP) "
         "toplamıdır - ekibin o ay için taahhüt ettiği iş büyüklüğü. Çok yüksek taahhüt "
         "kapasiteyi zorlayabilir; çok düşük taahhüt ekibin az iş aldığına işaret eder."
     ),
@@ -178,7 +179,7 @@ KPI_HELP: dict[str, str] = {
         "yürütme sorunlarını gösterir."
     ),
     "plan_disi_orani": (
-        "Toplam tamamlanan SP içinde, etiketinde 'SprintDışı' geçen (plansız eklenen) "
+        "Toplam tamamlanan SP içinde, etiket veya etkin tarih fallback'iyle plansız sayılan "
         "işlerin oranıdır. Yüksek oran (>%30) sık sık plan dışına çıkıldığını, düşük "
         "oran (<%15) planlamanın gerçekçi olduğunu gösterir."
     ),
@@ -303,12 +304,12 @@ KPI_HELP: dict[str, str] = {
         "düşükse üzerinde biriken/tamamlanamayan iş olabilir."
     ),
     "planlanan_isler": (
-        "'SprintDışı' etiketi taşımayan, yani ay başında taahhüt edilmiş "
+        "'SprintDışı' etiketi/fallback kuralıyla plan dışı sayılmayan, yani taahhüt edilmiş "
         "kartların listesidir. Bu listenin büyük kısmı 'Done' değilse, taahhüt "
         "edilen işin tamamlanamadığına işaret eder."
     ),
     "plan_disi_isler": (
-        "Etiketinde 'SprintDışı' geçen, yani ay içinde sonradan eklenen plansız "
+        "'SprintDışı' etiketiyle veya etkin tarih fallback'iyle plansız sayılan "
         "kartların listesidir. Bu listenin kabarık olması, sprint kapsamının sık "
         "sık dışarıdan müdahaleyle değiştiğini (scope creep) gösterir."
     ),
@@ -343,6 +344,12 @@ KPI_HELP: dict[str, str] = {
         "edenler) listelenir. Bu liste doluysa, aynı işin ay ay 'bitmeden tekrar "
         "açıldığını' - yani gerçek bir tamamlanmadan çok, kronik/tekrarlayan bir "
         "yükün elden ele dolaştığını gösterir."
+    ),
+    "devreden_isler": (
+        "Seçili sprintte bulunan ve Jira'nın Sprint alanında daha eski en az bir "
+        "sprint üyeliği de taşıyan gerçek kartlardır. Created tarihine veya benzer "
+        "iş adına göre tahmin yapılmaz; bu nedenle isim bazlı 'Devam Eden "
+        "Darboğazlar' analizinden farklıdır."
     ),
 }
 
@@ -2103,6 +2110,39 @@ elif page == PAGE_PROJE:
 # --------------------------------------------------------------------------
 
 elif page == PAGE_AKIS:
+    carried = analyze_carried_over_issues(df_scope, target_month=selected_month)
+    _section(
+        "Devreden İşler",
+        "Önceki sprintlerden seçili sprinte taşınan gerçek Jira kartları",
+        help_text=KPI_HELP["devreden_isler"],
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        _tile(
+            "Toplam Devreden",
+            str(carried["toplam_kart"]),
+            caption=f"{carried['toplam_sp']:.0f} SP",
+        )
+    with c2:
+        _tile(
+            "Devam Eden",
+            str(carried["devam_eden_kart"]),
+            caption=f"{carried['devam_eden_sp']:.0f} SP",
+            accent=STATUS["warning"],
+        )
+    with c3:
+        _tile(
+            "Tamamlanan",
+            str(carried["tamamlanan_kart"]),
+            caption=f"{carried['tamamlanan_sp']:.0f} SP",
+            accent=STATUS["good"],
+        )
+    if carried["kartlar"].empty:
+        st.caption("Seçili sprintte önceki bir sprintten devreden kart bulunamadı.")
+    else:
+        st.dataframe(carried["kartlar"], width="stretch", hide_index=True)
+
+    st.divider()
     _section(
         "Ham Statü Dağılımı",
         "Jira'nın ham statü alanına göre kart dağılımı",
@@ -2477,6 +2517,10 @@ elif page == PAGE_AKIS:
                     ],
                 ),
                 ShareSection(baslik="Ham Statü Dağılımı", tablo=_share_table(status_df)),
+                ShareSection(
+                    baslik="Devreden İşler",
+                    tablo=_share_table(carried["kartlar"]),
+                ),
                 ShareSection(
                     baslik="Devam Eden Darboğazlar (İsim Bazlı)", tablo=_share_table(recurring_df)
                 ),
