@@ -153,8 +153,20 @@ MONTH_NUMBERS_TR = {
 # Sprint adindan ay ve yil yakalar: "MS Sprint - Temmuz 26" -> ("temmuz", "26").
 # Yil 4, 2 ya da (veride goruldugu uzere KESIK) 1 haneli olabilir - bkz.
 # `build_sprint_period_map`.
+#
+# Ay ile yil ARASINA girebilen kelimeler: farkli board'lar farkli sablon kullanir -
+# MS "MS Sprint - Eylül 26" yazarken RZN "Eylül İterasyonu - 2025" yazar. Aradaki
+# bu tek kelime OPSIYONELDIR, yani MS bicimi HIC ETKILENMEZ; sadece araya
+# "iterasyon(u)" / "sprint(i)" gireni de yakalamis oluruz.
+#
+# Kasitli olarak SERBEST metin degil, SAYILI bir kelime listesi kabul edilir
+# (`.*?` gibi bir joker, "Mart raporu 2024 butcesi" turu adlarda alakasiz bir
+# sayiyi yil sanip yanlis aya baglardi).
+_SPRINT_ARA_KELIMELER = r"(?:iterasyonu|iterasyon|sprinti|sprint)"
 SPRINT_MONTH_PATTERN = re.compile(
-    r"\b(" + "|".join(MONTH_NUMBERS_TR) + r")\b[\s._/-]*(\d{1,4})\b"
+    r"\b(" + "|".join(MONTH_NUMBERS_TR) + r")\b"
+    r"[\s._/-]*" + _SPRINT_ARA_KELIMELER + r"?[\s._/-]*"
+    r"(\d{1,4})\b"
 )
 
 ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp1254", "iso-8859-9")

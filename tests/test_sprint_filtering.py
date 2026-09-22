@@ -126,8 +126,60 @@ class SprintLabelParsingTests(unittest.TestCase):
         ])
         self.assertEqual(str(period_map["MS Sprint - Nisan 2"]), "2026-04")
 
+    def test_rzn_iterasyon_bicimi_cozulur(self):
+        """RZN board'u "Eylül İterasyonu - 2025" sablonunu kullanir; MS ise
+        "MS Sprint - Eylül 26". Ay ile yil arasina giren kelime opsiyoneldir."""
+        period_map = build_sprint_period_map([
+            "Eylül İterasyonu - 2025",
+            "Şubat İterasyonu - 2026",
+            "Agustos İterasyonu - 2026",
+            "Aralık İterasyonu - 2023",
+        ])
+        self.assertEqual(str(period_map["Eylül İterasyonu - 2025"]), "2025-09")
+        self.assertEqual(str(period_map["Şubat İterasyonu - 2026"]), "2026-02")
+        self.assertEqual(str(period_map["Agustos İterasyonu - 2026"]), "2026-08")
+        self.assertEqual(str(period_map["Aralık İterasyonu - 2023"]), "2023-12")
+
+    def test_ms_bicimi_RZN_destegi_eklenince_DEGISMEZ(self):
+        """Regresyon kilidi: RZN destegi MS'in mevcut cozumlerini kaydirmamali.
+        Gercek MS sprint adlariyla dogrulanir."""
+        ms_adlari = {
+            "MS Sprint - Ocak 26": "2026-01",
+            "MS Sprint - Subat 26": "2026-02",
+            "MS Sprint - Mart 26": "2026-03",
+            "MS Sprint - Mayıs 26": "2026-05",
+            "MS Sprint - Haziran 26": "2026-06",
+            "MS Sprint - Temmuz 26": "2026-07",
+            "MS Sprint - Agustos 26": "2026-08",
+            "MS Sprint - Eylül 26": "2026-09",
+            "MS Sprint - Aralık 25": "2025-12",
+            "MS Sprint - Temmuz 25": "2025-07",
+        }
+        period_map = build_sprint_period_map(ms_adlari)
+        for ad, beklenen in ms_adlari.items():
+            with self.subTest(sprint=ad):
+                self.assertEqual(str(period_map[ad]), beklenen)
+
+    def test_iki_board_ayni_anda_dogru_cozulur(self):
+        """Tek bir veri setinde her iki sablon birlikte bulunursa ikisi de
+        kendi ayina cozulmeli (ayni ay + ayni yil ise ayni Period)."""
+        period_map = build_sprint_period_map([
+            "MS Sprint - Eylül 26", "Eylül İterasyonu - 2026",
+        ])
+        self.assertEqual(str(period_map["MS Sprint - Eylül 26"]), "2026-09")
+        self.assertEqual(str(period_map["Eylül İterasyonu - 2026"]), "2026-09")
+
     def test_ay_tasimayan_sprint_adi_cozulmez(self):
         period_map = build_sprint_period_map(["Sprint 2", "MS Sprint 3", ""])
+        self.assertEqual(period_map, {})
+
+    def test_ay_ile_yil_arasinda_serbest_metin_KABUL_EDILMEZ(self):
+        """Ara kelime listesi kasitli olarak DAR: joker bir desen, ay adiyla
+        alakasiz bir sayiyi yil sanip kartlari yanlis aya baglardi."""
+        period_map = build_sprint_period_map([
+            "Mart raporu ve 2024 butcesi",
+            "Nisan ayinda alinan 15 karar",
+        ])
         self.assertEqual(period_map, {})
 
 
