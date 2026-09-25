@@ -132,52 +132,27 @@ Gerekli Python sürümü: **3.10+**. Ana bağımlılıklar: `pandas`, `lxml`, `o
 streamlit run app/new_dashboard.py
 ```
 
-Açılan sayfada soldaki menüden kendi Jira raporunuzu (HTML, CSV veya XLSX) yükleyin; Ay/Kişi/Proje
-filtreleriyle tüm pano anında güncellenir. Kenar çubuğundaki sayfa seçiciyle
+Panel, proje kökündeki `.env` bağlantısıyla Jira verisini açılışta otomatik çeker.
+Ay/Kişi/Proje filtreleriyle tüm pano anında güncellenir. Kenar çubuğundaki sayfa seçiciyle
 şu 6 sayfa arasında gezinilir: Genel Bakış, Ekip & Kişiler, Proje & Konu, Akış &
 Darboğazlar, Akıllı Asistan (Ollama tabanlı, tamamen yerel sohbet - 🔒 bkz.
-yukarıdaki gizlilik notu) ve Rapor Merkezi (Excel indirme). Veri kaynağı olarak
-dosya yüklemenin yanı sıra, Jira'ya doğrudan canlı da bağlanabilirsiniz (bkz.
-aşağıdaki "Jira'ya Canlı Bağlanma").
+yukarıdaki gizlilik notu) ve Rapor Merkezi (Excel indirme).
 
 ### Jira'ya Canlı Bağlanma
 
-Dosya yüklemek yerine, Jira Data Center'a doğrudan bağlanıp veriyi canlı da
-çekebilirsiniz - kenar çubuğundaki "Veri Kaynağı" seçicisinden "🔗 Jira'ya Canlı
-Bağlan"ı seçin. Akış iki aşamalıdır:
+`.env.example` dosyasını `.env` olarak kopyalayıp Jira URL, PAT, proje anahtarı
+ve Story Points alan ID'sini doldurun. Developer ve Analyst alan ID'leri isteğe
+bağlıdır. Panel açılınca veri otomatik çekilir. Proje veya diğer bağlantı
+ayarları değişirse önceki projenin oturum verisi temizlenir ve yeni proje çekilir.
 
-**1) Bağlan ve Keşfet**
+Sol panelin üstündeki **Jira Ayarları** bölümünde `.env` bağlantısı ve alan ID'leri
+düzenlenip kaydedilir. PAT alanı boş bırakılırsa mevcut token korunur. Kaydetme,
+yeni oturum veya `.env` değişikliği veriyi otomatik yeniden çeker.
+Jira erişilemezse önceki projenin verisi gösterilmez; bağlantı hatası yazılır.
+PAT ekranda gösterilmez.
 
-- **Jira URL**: Kurumunuzun Jira adresi (varsayılan `https://jira.turkcell.com.tr`).
-- **Personal Access Token (PAT)**: Jira'da sağ üstteki profil resminize tıklayıp
-  **Profile → Personal Access Tokens → Create token** yolunu izleyerek
-  oluşturabilirsiniz (kullanıcı adı/şifre gerekmez, sadece bu token yeterlidir).
-- **Proje Anahtarı (Project Key)**: Jira'daki bir kartın anahtarının (örn.
-  `MS-123`) tire öncesindeki kısmı (`MS`) - proje listesinde veya adres
-  çubuğunda da görünür.
-- **Kaç ay geriye gidilsin**: Varsayılan 6 - `created` tarihine göre o kadar
-  aylık kartlar çekilir.
-- **SSL doğrulamayı atla**: Yalnızca kurumsal ağınızda güvenli olduğunu
-  biliyorsanız işaretleyin; ilk deneme her zaman güvenli (sertifika
-  doğrulamalı) yapılır, sadece SSL hatası alınırsa VE bu kutu işaretliyse
-  otomatik olarak sertifikasız tekrar denenir.
-
-"Bağlan ve Keşfet"e bastığınızda, Story Points/Developer/Analyst alanları için
-otomatik bir eşleşme önerilir ve küçük bir örnek kart tablosu gösterilir -
-eşleşme yanlışsa/otomatik bulunamadıysa açılır listelerden elle
-düzeltebilir, önizlemeden doğru veri geldiğini gözle doğrulayabilirsiniz.
-
-**2) Onayla ve Tam Veriyi Çek**
-
-Eşleştirmeyi onayladıktan sonra bu butona basınca, seçilen tarih aralığındaki
-TÜM kartlar çekilir; panelin geri kalanı (Excel raporu, Akıllı Asistan dahil)
-sanki bir dosya yüklenmiş gibi hiçbir farkla karşılaşmadan çalışmaya devam eder.
-
-> 🔒 Personal Access Token'ınız diske yazılmaz veya loglanmaz, sadece o oturum
-> boyunca bellekte tutulur. Bir bağlantı hatası (geçersiz token, yetki, hatalı
-> proje anahtarı, ağ/SSL sorunu) durumunda açık ve spesifik bir hata mesajı
-> gösterilir, uygulama durmaz - "Veri Kaynağı" seçicisinden anında "📁 Dosya
-> Yükle"ye geri dönüp mevcut akışı kullanabilirsiniz.
+WIP Aging seçili sprintteki açık işleri oluşturulma ayına göre **0-1 ay**,
+**2-5 ay** ve **6+ ay** gruplarına ayırır. Üç grubun toplamı aktif iş sayısıdır.
 
 ### 2) MCP sunucusu (Claude Desktop vb.)
 

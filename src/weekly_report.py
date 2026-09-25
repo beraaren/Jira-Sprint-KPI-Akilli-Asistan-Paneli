@@ -48,8 +48,11 @@ from share_report import (
 )
 from processor import (
     BURNOUT_LOAD_MULTIPLIER,
+    BOTTLENECK_STATUS_KEYWORDS,
+    CANCELLED_STATUS_KEYWORDS,
     MONTH_LABELS_TR,
     _is_done,
+    _matches_any_keyword,
     _month_label,
     filter_planned_issues,
     filter_out_of_plan_issues,
@@ -92,11 +95,6 @@ DURGUN_IS_KRITIK_ESIGI = 5
 PLAN_DISI_ESIGI_YUZDE = 30.0
 # Sprint sonuna yetismek icin gereken hiz, mevcut hizin bu katini asarsa "kritik".
 YETISME_RISK_KATSAYISI = 1.25
-
-# Terminal (bir daha hareket etmeyen) statuler - kucuk harfe indirgenmis.
-TERMINAL_STATUSES = frozenset({"done", "cancelled", "canceled", "iptal"})
-# "Bloke" sayilan statuler.
-BLOKE_STATUSES = frozenset({"xl block", "block", "blocked", "bloke"})
 
 GUN_ADLARI = ("Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar")
 
@@ -203,11 +201,11 @@ def available_weeks(df: pd.DataFrame, last_n: int = 12) -> list[pd.Timestamp]:
 
 
 def _is_terminal(status: pd.Series) -> pd.Series:
-    return status.astype(str).str.strip().str.casefold().isin(TERMINAL_STATUSES)
+    return _is_done(status) | _matches_any_keyword(status, CANCELLED_STATUS_KEYWORDS)
 
 
 def _is_bloke(status: pd.Series) -> pd.Series:
-    return status.astype(str).str.strip().str.casefold().isin(BLOKE_STATUSES)
+    return _matches_any_keyword(status, BOTTLENECK_STATUS_KEYWORDS)
 
 
 def _completed_sp_in_week(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> float:

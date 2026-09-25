@@ -521,8 +521,8 @@ def _jql_project_term(project_key: str) -> str:
 
 
 def jira_person_field_to_display(value: object) -> str:
-    """Bir Jira ozel alaninin (tekil kullanici, kullanici LISTESI veya duz metin
-    olabilir) degerini, `standardize_dataframe`'in (`_combine_multi_value_columns`)
+    """Bir Jira kullanici alaninin (tekil kullanici veya kullanici LISTESI)
+    degerini, `standardize_dataframe`'in (`_combine_multi_value_columns`)
     HTML disa aktarimindaki gibi VIRGULLE AYRILMIS TEK bir okunakli metne cevirir -
     orn. `[{"displayName": "Kullanıcı A"}, {"displayName": "Kullanıcı B"}]` ->
     `"Kullanıcı A, Kullanıcı B"`. Deger yoksa/bossa bos string doner.
@@ -530,7 +530,8 @@ def jira_person_field_to_display(value: object) -> str:
     `_jira_issue_to_row` (tam veri cekiminde) VE `app/new_dashboard.py`'deki
     kesif-asamasi onizleme tablosu (kucuk ornek veri) TARAFINDAN ORTAK
     kullanilir - boylece onizlemede de tam veride de kullanici HAM Jira JSON'unu
-    (`[{'displayName': ...}]`) DEGIL, okunakli isimleri gorur."""
+    (`[{'displayName': ...}]`) DEGIL, okunakli isimleri gorur. Duz metin bir
+    kullanici alani degildir ve ekip hesabina alinmaz."""
     if not value:
         return ""
     if isinstance(value, list):
@@ -538,7 +539,10 @@ def jira_person_field_to_display(value: object) -> str:
         return ", ".join(n for n in names if n)
     if isinstance(value, dict):
         return str(value.get("displayName") or value.get("name") or "")
-    return str(value)
+    # Jira user-picker values are objects or lists of objects. A plain string
+    # here belongs to a text custom field, not to a person picker. File imports
+    # already parse their plain-text names in standardize_dataframe.
+    return ""
 
 
 # Jira'nin Sprint alani her kurulumda farkli bir `customfield_XXXXX` ID'sine
@@ -766,8 +770,9 @@ def fetch_issues_from_jira_api(
     """`discover_jira_fields` ile ONAYLANMIS alan eslestirmesini (`field_id_map` -
     `JIRA_FIELD_MAP_KEYS` ("story_points"/"developer"/"analyst") anahtarlariyla,
     degerleri Jira alan ID'si `str` veya secilmemisse `None`) kullanarak, son
-    `months_back` ay icinde acilmis TUM kartlari `startAt`/`maxResults` ile
-    SAYFALAYARAK ceker.
+    projedeki kartlari `startAt`/`maxResults` ile SAYFALAYARAK ceker. Sonra
+    `months_back` penceresindeki sprint uyeligini (sprint yoksa Created tarihini)
+    kullanir. Boylece eski acilip yeni sprinte tasinan kartlar kaybolmaz.
 
     Performans icin `fields` parametresiyle sadece gereken alanlar istenir
     (summary/issuetype/status/assignee/labels/components/created/resolutiondate/
@@ -787,7 +792,9 @@ def fetch_issues_from_jira_api(
     headers = _jira_auth_headers(token)
 
     start_date = (pd.Timestamp.now().normalize() - pd.DateOffset(months=months_back)).strftime("%Y-%m-%d")
-    jql = f'{_jql_project_term(project_key)} AND created >= "{start_date}" ORDER BY created ASC'
+    # A card created long ago can still belong to a recent sprint. Fetch the
+    # project before applying the window to sprint membership below.
+    jql = f'{_jql_project_term(project_key)} ORDER BY created ASC'
 
     story_points_id = field_id_map.get("story_points")
     developer_id = field_id_map.get("developer")
@@ -812,6 +819,7 @@ def fetch_issues_from_jira_api(
     )
 
     rows: list[dict] = []
+    ignored_text_person_fields: set[str] = set()
     start_at = 0
     total: int | None = None
     while total is None or start_at < total:
@@ -832,6 +840,11 @@ def fetch_issues_from_jira_api(
         issues = payload.get("issues", [])
         if not issues:
             break
+        for issue in issues:
+            fields = issue.get("fields") or {}
+            for role, field_id in (("Developer", developer_id), ("Analyst", analyst_id)):
+                if field_id and isinstance(fields.get(field_id), str) and fields[field_id].strip():
+                    ignored_text_person_fields.add(f"{role}: {field_id}")
         rows.extend(
             _jira_issue_to_row(
                 issue, story_points_id, developer_id, analyst_id, sprint_id, last_transition_id
@@ -845,7 +858,21 @@ def fetch_issues_from_jira_api(
         "Labels", "Created", "Resolved", "Story Points", "Developers", "Analysts",
         "Sprint", "Last Transition",
     ]
-    return pd.DataFrame(rows, columns=export_columns)
+    result = pd.DataFrame(rows, columns=export_columns)
+    if result.empty:
+        return result
+    normalized = standardize_dataframe(result)
+    cutoff = pd.Period(start_date[:7], freq="M")
+    recent_sprint = normalized["sprint_months"].map(
+        lambda months: any(pd.Period(month, freq="M") >= cutoff for month in months)
+    )
+    recent_created = normalized["created"].ge(pd.Timestamp(start_date)).fillna(False)
+    # Created is a fallback only when no sprint month can be resolved. This
+    # matches _row_month_keys and keeps old cards in recent iterations.
+    keep = recent_sprint | (normalized["sprint_months"].map(lambda months: not months) & recent_created)
+    result = result.loc[keep.to_numpy()].reset_index(drop=True)
+    result.attrs["ignored_text_person_fields"] = sorted(ignored_text_person_fields)
+    return result
 
 
 def _parse_jira_date(series: pd.Series) -> pd.Series:
@@ -2005,10 +2032,10 @@ HIGH_ESTIMATE_THRESHOLD = 8.0
 
 
 def _matches_any_keyword(status: pd.Series, keywords: tuple[str, ...]) -> pd.Series:
-    normalized = status.astype(str).str.casefold()
+    normalized = status.astype(str).map(_ascii_fold_tr)
     mask = pd.Series(False, index=status.index)
     for keyword in keywords:
-        mask |= normalized.str.contains(keyword, na=False, regex=False)
+        mask |= normalized.str.contains(_ascii_fold_tr(keyword), na=False, regex=False)
     return mask
 
 
@@ -2559,10 +2586,9 @@ def calculate_capacity_forecast_split(
 # Ileri Duzey Darbogaz ve Akis Analitigi
 # --------------------------------------------------------------------------
 
-# WIP Aging icin, BIRBIRINI DISLAYAN 3 "kova" (created ayinin referans aya gore kac
-# ay geride oldugu baz alinir). Bilincli tasarim: 0 ay (bu ay acilan) ve 4-5 ay once
-# acilan kartlar hicbir kovaya girmez - bkz. `_calculate_wip_aging` docstring'i.
-WIP_BUCKET_LABELS = ("Bir Önceki Aydan Gelen", "3 Aylık Olan", "6 Aylık / Uzun Süreli")
+# WIP Aging kovalarinin toplami aktif is sayisina esittir. Bu ay acilan ve 4-5
+# aylik kartlar da bir kovaya girer; hicbir aktif kart grafikten kaybolmaz.
+WIP_BUCKET_LABELS = ("0-1 Aylık Aktif İş", "2-5 Aylık Aktif İş", "6+ Aylık Aktif İş")
 
 # "Blocker & Hold" analizinde statu/etiket/ozet metninde aranan anahtar kelimeler
 # (BOTTLENECK_STATUS_KEYWORDS'e ek olarak Ingilizce "waiting" de eklenmistir).
@@ -2592,74 +2618,34 @@ def _empty_wip_bucket() -> dict:
 
 
 def _wip_bucket_of(ay_farki: int) -> str | None:
-    """Bir kartin `created` ayinin referans aya gore kac ay geride oldugunu
-    (`ay_farki`) `WIP_BUCKET_LABELS`'tan birine esler; hicbiri uymuyorsa (0 ay
-    veya 4-5 ay once acilmis) None doner - bkz. WIP_BUCKET_LABELS yorumu."""
-    if ay_farki == 1:
+    """Aktif karti 0-1, 2-5 veya 6+ aylik kovaya yerlestirir."""
+    if ay_farki < 0:
+        return None
+    if ay_farki <= 1:
         return WIP_BUCKET_LABELS[0]
-    if ay_farki in (2, 3):
+    if ay_farki <= 5:
         return WIP_BUCKET_LABELS[1]
-    if ay_farki >= 6:
-        return WIP_BUCKET_LABELS[2]
-    return None
+    return WIP_BUCKET_LABELS[2]
 
 
 def _calculate_wip_aging(df: pd.DataFrame, target_month: str | None = None) -> dict:
-    """Metot 1 - WIP Aging: henuz `Done` olmayan (ve iptal edilmemis), VE
-    "AYLAR ARASI SUREKLILIK" gosteren (bkz. `_find_continuing_name_pairs` -
-    `detect_recurring_bottlenecks` ile AYNI kritik kural) aktif isleri, `created`
-    ayinin referans aya (target_month verilmisse o ay, verilmemisse icinde
-    bulunulan ay) gore kac ay geride oldugu baz alinarak 3 kovaya ayirir.
+    """Secili sprintte Done/iptal olmayan kartlarin yasini hesaplar.
 
-    SUREKLILIK SARTI (dahil etme icin ZORUNLU - projenin en kritik is kurali):
-    bir kart, SADECE VE SADECE kendi (temel_isim, assignee) ciftinin GUNCEL
-    REFERANS AYDA da EN AZ BIR karti VARSA WIP Aging'e dahil edilir - yani bu ay
-    ayni isim/sorumlu kombinasyonuyla YENIDEN karsimiza cikmayan bir kart (bu ay
-    icin hicbir "task olarak gorunmeyen" bir is), gecmisten kalma aktif bir kart
-    olsa bile ARTIK GOSTERILMEZ. Salt "henuz Done olmamasi" TEK BASINA yeterli
-    DEGILDIR. Bu, `aktif_is_sayisi`, `ortalama_yas_gun` ve TUM kova
-    sayilarini/tablolarini dogrudan ETKILER (once "Done olmayanlar" bulunur,
-    sonra bunlardan SADECE sureklilik gosterenler kovalara girer - geri kalanlar
-    hicbir yerde gorunmez).
-
-    Kovalar BIRBIRINI DISLAR (bkz. `WIP_BUCKET_LABELS`, `_wip_bucket_of`): "Bir
-    Önceki Aydan Gelen" (tam 1 ay once acilmis), "3 Aylık Olan" (2-3 ay once
-    acilmis), "6 Aylık / Uzun Süreli" (6+ ay once acilmis). Bu ay acilan veya
-    4-5 ay once acilan kartlar bilincli olarak hicbir kovaya girmez (genel
-    `aktif_is_sayisi`'nda hala sayilir - sureklilik sartini sagladigi surece).
-
-    ONEMLI: `target_month` sadece referans tarihi (hangi ayin sonuna gore "kac ay
-    geride" hesaplanacagini) belirler - `df`, digitli darbogaz metotlarinin aksine
-    BURADA `filter_by_month` ile o aya DARALTILMAZ (sureklilik kontrolu icin
-    ONCEKI aylarin da gorulebilmesi gerekir).
+    Referans tarihi secili ayin sonu, devam eden ay icin bugundur. Yaslanma
+    kovalari 0-1, 2-5 ve 6+ aylik kartlari gosterir. Kova toplami aktif kart
+    sayisina esittir. Isim/sorumlu eslesmesi bu metrikte aranmaz.
     """
-    if target_month:
-        month_scoped = filter_by_month(df, target_month)
-        if not month_scoped.empty and month_scoped["created"].notna().any():
-            reference_date = month_scoped["created"].dropna().dt.to_period("M").iloc[0].end_time
-        else:
-            reference_date = pd.Timestamp.now()
-    else:
-        reference_date = pd.Timestamp.now()
+    month_scoped = filter_by_month(df, target_month) if target_month else df
+    reference_date = pd.Timestamp.now()
+    if target_month and month_scoped.attrs.get("analysis_period"):
+        period = pd.Period(month_scoped.attrs["analysis_period"], freq="M")
+        reference_date = min(period.end_time, reference_date)
     ref_period = pd.Timestamp(reference_date).to_period("M")
 
-    is_cancelled = _matches_any_keyword(df["status"], CANCELLED_STATUS_KEYWORDS)
-    not_done = df.loc[
-        ~_is_done(df["status"]) & ~is_cancelled & df["created"].notna() & (df["created"] <= reference_date)
-    ].copy()
-
-    # SUREKLILIK FILTRESI: "Done degil" olmak TEK BASINA yetmez - kartin
-    # (temel_isim, assignee) cifti GUNCEL referans ayda da gorulmus olmali (bkz.
-    # `_find_continuing_name_pairs`, tam veri `df` uzerinde - sadece `not_done`
-    # degil - hesaplanir, cunku onceki ayki kartin Done olup olmadigi degil sadece
-    # VAR OLUP OLMADIGI onemlidir).
-    devam_eden_ciftler, _, _ = _find_continuing_name_pairs(df, target_month)
-    not_done["_temel_isim"] = not_done["summary"].map(_strip_percent_suffix)
-    active = not_done.loc[
-        [
-            (temel_isim, sorumlu) in devam_eden_ciftler
-            for temel_isim, sorumlu in zip(not_done["_temel_isim"], not_done["assignee"])
-        ]
+    is_cancelled = _matches_any_keyword(month_scoped["status"], CANCELLED_STATUS_KEYWORDS)
+    active = month_scoped.loc[
+        ~_is_done(month_scoped["status"]) & ~is_cancelled
+        & month_scoped["created"].notna() & (month_scoped["created"] <= reference_date)
     ].copy()
 
     if active.empty:
@@ -2716,50 +2702,14 @@ def _calculate_wip_aging(df: pd.DataFrame, target_month: str | None = None) -> d
     }
 
 
-def _scope_to_continuing_pairs(df: pd.DataFrame, target_month: str | None = None) -> pd.DataFrame:
-    """`filter_by_month` ile hedef aya daraltir, SONRA sadece "AYLAR ARASI
-    SUREKLILIK" gosteren (bkz. `_find_continuing_name_pairs` - projenin en kritik
-    is kurali, `detect_recurring_bottlenecks`/`_calculate_wip_aging` ile AYNI)
-    kartlari birakir: bir kartin (temel_isim, assignee) cifti bir ONCEKI
-    (ardisik) ayda da gorulmemisse (yani bu ay ILK KEZ acilmis, gecmisi olmayan
-    bir kartsa), o kart elenir. `_calculate_blocker_hold`, `_calculate_reopen_
-    rate` ve `_calculate_assignee_bouncing` (Metot 2-3-4), hedef ay icin
-    tikanma/reopen/yuk-yogunlasma hesaplarken SADECE bu sekilde surekliligi
-    kanitlanmis (ayni is birden fazla ay ustuste karsimiza cikan) kartlari
-    dikkate alir - tek seferlik/yeni acilan bir kartin bu metriklere "gurultu"
-    olarak karismasini engeller.
-
-    `target_month` verilmezse (yani "tum aylar" gorunumu) SUREKLILIK FILTRESI
-    UYGULANMAZ, `df` OLDUGU GIBI doner - cunku sureklilik ozunde AY-AY-AY bir
-    kiyaslamadir ("bu ay" ile "bir onceki ay" arasinda), tum yillarin verisi tek
-    bir "referans ay" etrafinda daraltilamaz; bu durumda ilgili metrikler eskisi
-    gibi TUM veriyi kullanmaya devam eder (bkz. `filter_by_month`'un ayni
-    davranisi - `target_month` yoksa filtrelemez).
-    """
-    if not target_month:
-        return df
-
-    scoped = filter_by_month(df, target_month)
-    if scoped.empty:
-        return scoped
-
-    devam_eden_ciftler, _, _ = _find_continuing_name_pairs(df, target_month)
-    temel_isimler = scoped["summary"].map(_strip_percent_suffix)
-    mask = [(t, a) in devam_eden_ciftler for t, a in zip(temel_isimler, scoped["assignee"])]
-    return scoped.loc[mask].reset_index(drop=True)
-
-
 def _calculate_blocker_hold(df: pd.DataFrame, target_month: str | None = None) -> dict:
     """Metot 2 - Blocker & Hold Analizi: statu, etiket veya ozet metninde
     `ADVANCED_BLOCKER_KEYWORDS` (block/hold/bekle/stuck/engel/wait) gecen kartlarin
     is/SP oranini ve "maliyetini" (tikanmis SP miktarini) hesaplar.
 
-    `target_month` verilmisse, once o aya daraltilir SONRA sadece "aylar arasi
-    sureklilik" gosteren (bkz. `_scope_to_continuing_pairs`) kartlar dikkate
-    alinir - bu ay ilk kez acilan (gecmisi olmayan) bir kart, hemen tikanmis
-    olsa bile bu metrige DAHIL EDILMEZ.
+    `target_month` verilmisse secili sprintteki butun kartlar dikkate alinir.
     """
-    scoped = _scope_to_continuing_pairs(df, target_month)
+    scoped = filter_by_month(df, target_month) if target_month else df
 
     combined_text = (
         scoped["status"].astype(str)
@@ -2809,11 +2759,9 @@ def _calculate_assignee_bouncing(df: pd.DataFrame, target_month: str | None = No
     icindeki Pareto payi) bir PROXY olarak kullanir - `not` alaninda bu acikca
     belirtilir.
 
-    `target_month` verilmisse, is yuku SADECE "aylar arasi sureklilik" gosteren
-    (bkz. `_scope_to_continuing_pairs`) kartlar uzerinden hesaplanir - bu ay ilk
-    kez acilan (gecmisi olmayan) kartlar yuk yogunlasmasi hesabina KATILMAZ.
+    `target_month` verilmisse secili sprintteki butun kartlar hesaba katilir.
     """
-    metrics = calculate_assignee_metrics(_scope_to_continuing_pairs(df, target_month))
+    metrics = calculate_assignee_metrics(filter_by_month(df, target_month) if target_month else df)
     not_metni = (
         "El değiştirme (handoff) geçmişi Jira export'unda bulunmadığından, bu metrik "
         "mevcut iş yükü yoğunlaşması (Pareto oranı) üzerinden tahmini olarak hesaplanmıştır."
@@ -2851,12 +2799,9 @@ def _calculate_reopen_rate(df: pd.DataFrame, target_month: str | None = None) ->
     olarak kullanilir - hangi yontemin kullanildigi `yontem`/`aciklama` alanlarinda
     seffaf sekilde belirtilir.
 
-    `target_month` verilmisse, once o aya daraltilir SONRA sadece "aylar arasi
-    sureklilik" gosteren (bkz. `_scope_to_continuing_pairs`) kartlar dikkate
-    alinir - bu ay ilk kez acilan (gecmisi olmayan) bir kart, reopen orani
-    hesabina KATILMAZ.
+    `target_month` verilmisse secili sprintteki butun kartlar dikkate alinir.
     """
-    scoped = _scope_to_continuing_pairs(df, target_month)
+    scoped = filter_by_month(df, target_month) if target_month else df
     toplam = len(scoped)
 
     if toplam == 0:
@@ -2878,7 +2823,9 @@ def _calculate_reopen_rate(df: pd.DataFrame, target_month: str | None = None) ->
             "geri dönüş (reopen) olarak sayıldı."
         )
     else:
-        reopened_mask = _matches_any_keyword(scoped["status"], ("test",)) & ~_is_done(scoped["status"])
+        test_status = _matches_any_keyword(scoped["status"], ("test",))
+        phase_done = scoped["status"].astype(str).str.contains(r"\bdone\b", case=False, na=False)
+        reopened_mask = test_status & ~phase_done & ~_is_done(scoped["status"])
         yontem = "test_asamasinda_takilma"
         aciklama = (
             "Jira export'unda 'Resolved' tarihi bulunmadığından gerçek reopen izlenemiyor; "
@@ -2996,20 +2943,15 @@ def _find_continuing_name_pairs(
     """Projenin en kritik is kuralinin ORTAK/tek uygulamasi: bir (temel_isim,
     assignee) cifti "AYLAR ARASI SUREKLILIK" gosteriyor mu, yani bir is bir
     onceki (ardisik takvim) aydan bu güncel referans aya GERCEKTEN DEVAM ETMIS
-    mi? Hem `detect_recurring_bottlenecks` hem `_calculate_wip_aging` (bu ciftte
-    OLMAYAN - yani bu ay ayni isim/sorumluyla yeniden karsimiza cikmayan - aktif
-    kartlari WIP Aging'den TAMAMEN CIKARMAK icin) bu fonksiyonu kullanir - boylece
-    "devam eden is" tanimi TEK bir yerden yonetilir, iki yerde ayri ayri
-    tutarsiz sekilde tekrarlanmaz.
+    mi? `detect_recurring_bottlenecks` icin aylar arasi ayni isim ve sorumluyu
+    eslestirir. WIP ve secili sprint akisi bu eslesmeye bagli degildir.
 
     KURAL: bir cift SADECE VE SADECE GUNCEL REFERANS AYDA (bkz. asagida) EN AZ
     BIR karti VE bir ONCEKI (ardisik takvim) ayda DA EN AZ BIR karti varsa
     "devam eden" sayilir. `Done`/not-`Done` durumu bu karara HIC KARISMAZ -
     onceki ayki kart `Done` gorunse bile, ayni isim (yuzdesiz) bu ay yine
-    acildiysa bu bir sureklilik isaretidir; sadece "bu ay `Done` degil" olmasi
-    TEK BASINA yeterli DEGILDIR - gecmisi olmayan, bu ay ilk kez acilmis bir
-    kart bu fonksiyona gore "devam eden" SAYILMAZ (bir onceki ayda hicbir
-    karsiligi yoktur).
+    acildiysa bu bir sureklilik isaretidir. Gecmisi olmayan, bu ay ilk kez
+    acilmis bir kart bu fonksiyona gore "devam eden" SAYILMAZ.
 
     Referans ay: `target_month` verilmisse `filter_by_month` ile AYNI
     eslestirme mantigiyla (kismi/buyuk-kucuk harf duyarsiz ay adi eslesmesi,

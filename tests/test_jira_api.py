@@ -23,6 +23,7 @@ if str(SRC_DIR) not in sys.path:
 from processor import (  # noqa: E402
     JiraApiError,
     JiraSslError,
+    MONTH_LABELS_TR,
     discover_jira_fields,
     fetch_issues_from_jira_api,
     standardize_dataframe,
@@ -164,6 +165,31 @@ class FetchIssuesFromJiraApiTests(unittest.TestCase):
         self.assertIn("summary", requested)
         # Sprint alani otomatik bulunup istege eklenmis olmali.
         self.assertIn("customfield_10050", requested)
+
+    def test_old_created_card_in_current_sprint_is_retained(self):
+        current = pd.Timestamp.now().to_period("M")
+        old = current - 3
+        current_issue = self._fake_issue("MS-1", "Carried", [], [])
+        old_issue = self._fake_issue("MS-2", "Old sprint", [], [])
+        for issue, period in ((current_issue, current), (old_issue, old)):
+            issue["fields"]["created"] = "2020-01-01T10:00:00.000+0300"
+            issue["fields"]["customfield_10050"] = [{
+                "name": f"MS Sprint - {MONTH_LABELS_TR[period.month]} {period.year}"
+            }]
+        response = _make_response(200, {"issues": [current_issue, old_issue], "total": 2})
+        with patch("processor.requests.get", side_effect=[self._field_response(), response]) as mock_get:
+            result = fetch_issues_from_jira_api(BASE_URL, TOKEN, PROJECT_KEY, self.FIELD_MAP, months_back=1)
+        self.assertEqual(result["Summary"].tolist(), ["Carried"])
+        self.assertNotIn("created >=", self._search_calls(mock_get)[0].kwargs["params"]["jql"])
+
+    def test_text_custom_field_cannot_become_analyst(self):
+        issue = self._fake_issue("MS-3", "Text field", [], [])
+        issue["fields"]["customfield_10040"] = "Lütfen analiz dokümanını ya da confluence linki ekleyiniz."
+        response = _make_response(200, {"issues": [issue], "total": 1})
+        with patch("processor.requests.get", side_effect=[self._field_response(), response]):
+            result = fetch_issues_from_jira_api(BASE_URL, TOKEN, PROJECT_KEY, self.FIELD_MAP)
+        self.assertEqual(result.loc[0, "Analysts"], "")
+        self.assertEqual(result.attrs["ignored_text_person_fields"], ["Analyst: customfield_10040"])
 
     def test_multi_value_developer_field_and_standardize_dataframe_roundtrip(self):
         """Coklu developer/analist listesi virgulle-ayrilmis TEK hucreye donmeli

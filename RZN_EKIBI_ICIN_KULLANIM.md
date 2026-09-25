@@ -19,27 +19,16 @@ Sonraki her kullanımda sadece 2. adım yeterli.
 
 ---
 
-## 2. Veriyi yükleme
+## 2. Jira bağlantısı
 
-Sol menüdeki **Veri Kaynağı** seçiminden iki yol var:
+Proje kökündeki `.env` dosyasında `JIRA_PROJECT_KEY=RZN`, Jira URL, PAT ve
+`JIRA_FIELD_STORY_POINTS` alanını doldurun. Developer/Analyst alan ID'leri
+isteğe bağlıdır; yanlış kişi alanı seçilirse panel uyarı gösterir.
 
-### 📁 Dosya Yükle
-Jira'dan dışa aktardığınız raporu (HTML, CSV veya XLSX) sürükleyip bırakın.
-
-### 🔗 Jira'ya Canlı Bağlan *(önerilen)*
-Dışa aktarma adımını atlar, veriyi doğrudan çeker:
-
-| Alan | RZN için değer |
-|---|---|
-| Jira URL | `https://jira.turkcell.com.tr` |
-| Personal Access Token | Jira → sağ üst profil → **Profile → Personal Access Tokens → Create token** |
-| Proje Anahtarı | **`RZN`** |
-| Kaç ay geriye | Varsayılan 6 (ihtiyacınıza göre artırın) |
-
-**Bağlan ve Keşfet** → Story Points / Developer / Analist alanları otomatik bulunur,
-örnek kartlarla gözle doğrularsınız → **Onayla ve Tam Veriyi Çek**.
-
-Token diske yazılmaz, sadece o oturumda bellekte tutulur.
+Panel açılışta RZN verisini otomatik çeker. Sol panelin üstündeki **Jira Ayarları** bölümünde
+bağlantı ve alan ID'leri düzenlenip `.env` dosyasına kaydedilir. PAT alanını boş
+bırakırsanız mevcut token korunur. Kaydetme sonrası yeni veri otomatik çekilir;
+eski projenin oturum verisi temizlenir. PAT ekranda gösterilmez.
 
 ---
 
@@ -159,9 +148,9 @@ ekibe gönder.
 
 ## 6. Bilinen kısıtlar
 
-Bunlar RZN'ye özgü; panel hata vermez ama bu başlıklarda **yanlış sonuç üretir**.
+Bunlar RZN'ye özgü veri ve süreç farklarıdır.
 
-### Bloke ve iptal statüleri tanınmıyor
+### Faz bazlı statüler
 
 Statü yapınız fazlara ayrılmış:
 
@@ -170,14 +159,18 @@ Analiz · Analiz Done · Analiz XL Block · Development · Development Done ·
 Development XL BLOCK · Done · Test · Test Done · Test XL Block · To Do · İptal
 ```
 
-Panel bu statülerden:
-- **`Done`'u doğru tanır** → tamamlanma oranları, KPI'lar, raporlar **doğru**
-- **Üç `XL Block` varyantını tanımaz** → *bloke iş* ve *duran iş* sayıları **0 çıkar**
-- **`İptal`'i tanımaz** → iptal edilen kartlar "hâlâ açık" sayılır
+Panel yalnızca genel `Done` durumunu tamamlanmış iş sayar. `Analiz Done`,
+`Development Done` ve `Test Done` fazın tamamlandığını gösterir; kart genel
+`Done` durumuna geçene kadar WIP içinde kalır. Üç `XL Block` varyantı bloke,
+`İptal` ise kapanmış/aktif olmayan iş olarak tanınır.
 
-**Pratik sonuç:** Haftalık Özet'teki "bloke iş" ve "duran iş" satırlarına ve Akış &
-Darboğazlar sayfasındaki bloke sayılarına RZN'de **güvenmeyin**. Sprint KPI'ları,
-tamamlanma oranları, tempo ve raporlar etkilenmez.
+WIP ve akış proxy'leri seçili sprintteki kartları kullanır. Tekrar eden iş adı ve
+sorumlu eşleşmesi yalnızca **Devam Eden Darboğazlar (İsim Bazlı)** analizi içindir.
+WIP yaş grupları 0-1, 2-5 ve 6+ aydır; bütün aktif kartlar bu gruplardan birinde
+görünür.
+Jira'da durum geçiş geçmişi yoksa "Reopen" yerine test aşamasında bekleyen kart
+oranı gösterilir; `Test Done` buna dahil edilmez. El değiştirme geçmişi yoksa
+gösterilen oran iş yükü yoğunlaşmasıdır, gerçek handoff sayısı değildir.
 
 ### Component alanı boş
 

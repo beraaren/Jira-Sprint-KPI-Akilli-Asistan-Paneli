@@ -12,8 +12,10 @@ bir fonksiyonu da bir "Proje" filtresi olarak devreye sokar.
 from __future__ import annotations
 
 import base64
+import importlib
 import sys
 import tempfile
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -28,6 +30,19 @@ PROJECT_ROOT = APP_DIR.parent
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+# Streamlit keeps imported modules between reruns. An already running dashboard
+# can hold the previous config module after the settings editor is added.
+import config as jira_config_module  # noqa: E402
+if not hasattr(jira_config_module, "save_jira_settings"):
+    importlib.reload(jira_config_module)
+
+# Keep the corrected WIP calculation active in an already open Streamlit process.
+import processor as jira_processor_module  # noqa: E402
+if getattr(jira_processor_module, "WIP_BUCKET_LABELS", None) != (
+    "0-1 Aylık Aktif İş", "2-5 Aylık Aktif İş", "6+ Aylık Aktif İş"
+):
+    importlib.reload(jira_processor_module)
 
 from processor import (  # noqa: E402
     JiraApiError,
@@ -46,7 +61,6 @@ from processor import (  # noqa: E402
     calculate_status_breakdown,
     compare_yearly_sprints,
     detect_recurring_bottlenecks,
-    discover_jira_fields,
     drop_duplicate_rows,
     explode_by_role,
     fetch_issues_from_jira_api,
@@ -57,7 +71,6 @@ from processor import (  # noqa: E402
     filter_planned_issues,
     get_assignee_deep_dive,
     get_topic_deep_dive,
-    jira_person_field_to_display,
     process_sprint_report,
     read_sprint_report,
     run_core_5_kpi_analyses,
@@ -79,7 +92,7 @@ from weekly_report import (  # noqa: E402
     finding_sentence as weekly_finding_sentence,
     week_label,
 )
-from config import env_snippet, load_jira_config  # noqa: E402
+from config import load_jira_config, save_jira_settings  # noqa: E402
 from pdf_reporter import PdfFontError, create_pdf_report  # noqa: E402
 from reporter import create_excel_report  # noqa: E402
 from llm_assistant import AssistantUnavailableError, DEFAULT_MODEL, chat_with_local_model  # noqa: E402
@@ -143,17 +156,17 @@ FLOW_STAGE_COLORS = {
 }
 
 WIP_BUCKET_STATUS = {
-    "Bir Önceki Aydan Gelen": "warning",
-    "3 Aylık Olan": "serious",
-    "6 Aylık / Uzun Süreli": "critical",
+    "0-1 Aylık Aktif İş": "warning",
+    "2-5 Aylık Aktif İş": "serious",
+    "6+ Aylık Aktif İş": "critical",
 }
 
 # `analyze_advanced_bottlenecks`'in `1_wip_aging` sozlugundeki kova anahtarlari ile
 # UI'da/gorafikte gosterilen Turkce etiketleri arasindaki esleme.
 WIP_BUCKET_KEY_TO_LABEL = {
-    "onceki_ay": "Bir Önceki Aydan Gelen",
-    "uc_aylik": "3 Aylık Olan",
-    "alti_aylik": "6 Aylık / Uzun Süreli",
+    "onceki_ay": "0-1 Aylık Aktif İş",
+    "uc_aylik": "2-5 Aylık Aktif İş",
+    "alti_aylik": "6+ Aylık Aktif İş",
 }
 WIP_BUCKET_LABEL_TO_KEY = {v: k for k, v in WIP_BUCKET_KEY_TO_LABEL.items()}
 
@@ -228,15 +241,13 @@ KPI_HELP: dict[str, str] = {
         "toplam SP görünür). En yüksek değer, en çok kaynak tüketen konuyu gösterir."
     ),
     "wip_onceki_ay": (
-        "Bir önceki takvim ayında açılmış ve hâlâ 'Done' olmamış kartların sayısı/"
-        "SP'sidir. Bu grubun büyümesi, sprint kapanışında iş bitirilemediğini gösterir."
+        "Bu ay veya bir önceki ay açılmış, seçili sprintte hâlâ aktif kartların sayısı ve SP'sidir."
     ),
     "wip_uc_aylik": (
-        "2-3 ay önce açılmış ve hâlâ açık olan kartlardır. Bu grubun büyümesi, "
-        "işlerin bir-iki sprintten fazla sürede tamamlanamadığını gösterir."
+        "2-5 ay önce açılmış ve seçili sprintte hâlâ aktif olan kartlardır."
     ),
     "wip_alti_aylik": (
-        "6 ay veya daha uzun süredir açık olan kronik/unutulmuş kartlardır. Yüksek "
+        "6 ay veya daha uzun süredir açık olan kartlardır. Yüksek "
         "sayı backlog temizliği veya süreç incelemesi gerektiğini gösterir."
     ),
     "blocker_hold": (
@@ -874,11 +885,11 @@ def _load_and_standardize(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 
 
 def _persist_uploaded_file(file_bytes: bytes, file_name: str) -> str:
-    """Yuklenen dosyayi, MCP tabanli Akıllı Asistan'in (mcp_server.py alt sureci
+    """Cekilen Jira verisini, MCP tabanli Akıllı Asistan'in (mcp_server.py alt sureci
     kendi surecinde dosyayi diskten okur) erisebilmesi icin OTURUM BOYUNCA
     diskte kalan bir gecici dosyaya yazar. Ayni dosya zaten yazilmissa (rerun'lar
     arasinda) tekrar yazmaz; farkli bir dosya yuklendiyse eskisini siler."""
-    upload_key = (file_name, len(file_bytes))
+    upload_key = (file_name, sha256(file_bytes).hexdigest())
     if st.session_state.get("_uploaded_file_key") == upload_key:
         return st.session_state["_uploaded_file_path"]
 
@@ -1094,20 +1105,8 @@ def _selected_rows_to_jira_import_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Jira'ya canli baglanti - "Kesif ve Onay" akisi
+# Jira'ya .env uzerinden otomatik baglanti
 # --------------------------------------------------------------------------
-
-# Kesif adiminda otomatik eslesen adaylar arasindan secim yapmak icin selectbox'lara
-# gosterilecek Turkce etiketler (bkz. discover_jira_fields'in JIRA_FIELD_CANDIDATE_
-# VARIANTS anahtarlariyla AYNI sirada).
-JIRA_FIELD_MAP_LABELS = {
-    "story_points": "Story Points (Büyüklük)",
-    "developer": "Developer",
-    "analyst": "Analyst",
-}
-
-JIRA_FIELD_NOT_SELECTED = "— (seçilmedi) —"
-
 
 def _call_jira_api_with_ssl_retry(func, *args, skip_ssl: bool, **kwargs):
     """Bir Jira API cagrisini ONCE `verify=True` (guvenli varsayilan) ile dener;
@@ -1126,250 +1125,134 @@ def _call_jira_api_with_ssl_retry(func, *args, skip_ssl: bool, **kwargs):
         return func(*args, verify=False, **kwargs)
 
 
-def _jira_sample_preview_df(sample_issues: list[dict], field_id_map: dict[str, str | None]) -> pd.DataFrame:
-    """`discover_jira_fields`'in HAM `sample_issues` JSON'unu, o an secili alan
-    eslestirmesine (`field_id_map`) gore kucuk bir onizleme tablosuna cevirir -
-    mentor secimi degistirdikce onizleme de guncellenir."""
-    rows = []
-    for issue in sample_issues:
-        fields = issue.get("fields") or {}
-        rows.append(
-            {
-                "Issue Type": (fields.get("issuetype") or {}).get("name", ""),
-                "Summary": fields.get("summary", "") or "",
-                "Assignee": (fields.get("assignee") or {}).get("displayName", "") or "",
-                "Story Points": fields.get(field_id_map.get("story_points") or "", ""),
-                "Developer": jira_person_field_to_display(fields.get(field_id_map.get("developer") or "")),
-                "Analyst": jira_person_field_to_display(fields.get(field_id_map.get("analyst") or "")),
-            }
-        )
-    return pd.DataFrame(rows)
+def _jira_config_signature(cfg) -> tuple:
+    """Identify the .env source without keeping its token in session state."""
+    return (
+        cfg.base_url,
+        cfg.project_key,
+        cfg.months_back,
+        cfg.skip_ssl,
+        tuple(sorted(cfg.field_id_map.items())),
+        sha256(cfg.token.encode("utf-8")).hexdigest(),
+    )
 
 
-def _render_jira_live_connect_ui() -> tuple[bytes | None, str | None]:
-    """Sidebar'da, Jira Data Center REST API'sinden canli veri cekmek icin IKI
-    ASAMALI bir "Keşif ve Onay" akisi kurar - proje sahibiyle (benimle) iletisime
-    gecmeden, mentorun kendi ekranindan alan eslestirmesini dogrulayip/duzeltip
-    devam edebilmesi icindir:
+def _fetch_env_jira_data(cfg) -> tuple[bytes | None, str | None, str | None]:
+    """Fetch once per source; discard old-project data before any new request."""
+    signature = _jira_config_signature(cfg)
+    data_keys = (
+        "_jira_fetched_bytes", "_jira_fetched_name", "_jira_fetch_error",
+        "_jira_fetch_attempted", "_jira_ignored_person_fields", "_jira_fetched_rows",
+        "chat_history", "excel_bytes", "excel_planned_df", "excel_out_of_plan_df",
+        "excel_planned_export_df", "excel_out_of_plan_export_df", "excel_filename",
+        "pdf_bytes", "pdf_filename",
+    )
+    if st.session_state.get("_jira_source_signature") != signature:
+        for key in data_keys:
+            st.session_state.pop(key, None)
+        st.session_state["_jira_source_signature"] = signature
 
-        1) "Bağlan ve Keşfet": `discover_jira_fields` ile alan listesi + kucuk bir
-           ornek veri cekilir; Story Points/Developer/Analyst icin otomatik
-           bulunan adaylar varsayilan secili gelir ama TUM alanlar arasindan elle
-           de secilebilir; ornek kartlarin onizlemesiyle "dogru veri mi" gozle
-           kontrol edilir.
-        2) "Onayla ve Tam Veriyi Çek": onaylanan eslestirmeyle `fetch_issues_
-           from_jira_api` TUM kartlari ceker; sonuc CSV byte'larina cevrilip
-           doner - boylece geri kalan pipeline (standardize_dataframe, Excel
-           export, Akıllı Asistan...) sanki bir DOSYA YUKLENMIS gibi hicbir
-           degisiklik gerekmeden calisir.
+    if not cfg.can_fetch_directly:
+        return None, None, "Jira baglantisi icin .env dosyasinda URL, PAT, proje ve Story Points alani gerekli."
 
-    Herhangi bir asamada hata olursa `st.error` ile spesifik (401/403/400/JQL/
-    baglanti/SSL) mesaj gosterilir, `st.stop()` cagirilmaz - kullanici hemen
-    ustteki "Veri Kaynağı" radio'sundan "📁 Dosya Yükle"'ye gecip mevcut akisi
-    kullanabilir (bu, geri donus/fallback gereksinimini otomatik karsilar).
-
-    Token, diske yazilmaz/loglanmaz - sadece bu oturumun `st.session_state`'inde
-    tutulur; hata mesajlarinda asla gosterilmez.
-    """
-    cfg = load_jira_config()
-
-    # --- Hizli yol: .env tam doluysa hicbir sey sorma, tek tikla (veya
-    # JIRA_AUTO_CONNECT=true ise hic tiklatmadan) tam veriyi cek. Kesif adimi,
-    # SADECE alan eslestirmesi bilinmedigi icin vardir - `.env` onu zaten
-    # veriyorsa atlanmasi gerekir.
-    if cfg.can_fetch_directly and not st.session_state.get("_jira_env_override"):
-        st.success(f"`.env`'den yüklendi: **{cfg.project_key}** · son {cfg.months_back} ay")
-        should_fetch = st.button("🔄 Jira'dan Verileri Çek", type="primary", key="jira_env_fetch_btn")
-        # Otomatik cekim oturumda YALNIZCA BIR KEZ - aksi halde her yeniden
-        # calistirmada (her filtre degisiminde) Jira'ya yeni istek giderdi.
-        if cfg.auto_connect and not st.session_state.get("_jira_autofetch_done"):
-            st.session_state["_jira_autofetch_done"] = True
-            should_fetch = True
-
-        if should_fetch:
-            with st.spinner("Jira'dan veriler çekiliyor..."):
-                try:
-                    full_df = _call_jira_api_with_ssl_retry(
-                        fetch_issues_from_jira_api,
-                        cfg.base_url,
-                        cfg.token,
-                        cfg.project_key,
-                        cfg.field_id_map,
-                        months_back=cfg.months_back,
-                        skip_ssl=cfg.skip_ssl,
-                    )
-                except JiraApiError as exc:
-                    st.error(str(exc))
-                else:
-                    if full_df.empty:
-                        st.warning(f"Son {cfg.months_back} ay içinde hiç kart bulunamadı.")
-                    else:
-                        st.session_state["_jira_fetched_bytes"] = full_df.to_csv(index=False).encode("utf-8-sig")
-                        st.session_state["_jira_fetched_name"] = "jira_canli_veri.csv"
-                        st.success(f"{len(full_df):,} kart Jira'dan çekildi.")
-
-        if st.button("⚙️ Ayarları elle değiştir", key="jira_env_override_btn"):
-            st.session_state["_jira_env_override"] = True
-            st.rerun()
-
-        return st.session_state.get("_jira_fetched_bytes"), st.session_state.get("_jira_fetched_name")
-
-    # --- Normal yol: alanlari `.env`'deki degerlerle ON DOLDUR, eksikleri sor.
-    if cfg.has_credentials:
-        st.caption("Alanlar `.env` dosyasından dolduruldu; gerekirse değiştirebilirsiniz.")
-
-    with st.form("jira_connect_form"):
-        base_url = st.text_input("Jira URL", value=cfg.base_url)
-        token = st.text_input(
-            "Personal Access Token",
-            type="password",
-            value=cfg.token,
-            help="`.env` içindeki JIRA_PAT alanına yazarsanız her açılışta sorulmaz.",
-        )
-        project_key = st.text_input(
-            "Proje Anahtarı (Project Key)",
-            value=cfg.project_key,
-            help="Anahtar (örn. MS) veya sayısal proje ID'si (örn. 31031) girebilirsiniz.",
-        )
-        months_back = st.number_input(
-            "Kaç ay geriye gidilsin", min_value=1, max_value=36, value=cfg.months_back, step=1
-        )
-        skip_ssl = st.checkbox(
-            "SSL doğrulamayı atla (yalnızca kurumsal ağda güvenliyse)", value=cfg.skip_ssl
-        )
-        discover_clicked = st.form_submit_button("Bağlan ve Keşfet")
-
-    if discover_clicked:
-        if not (base_url.strip() and token.strip() and project_key.strip()):
-            st.error("Jira URL, Personal Access Token ve Proje Anahtarı zorunludur.")
-        else:
-            try:
-                discovery = _call_jira_api_with_ssl_retry(
-                    discover_jira_fields, base_url.strip(), token, project_key.strip(), skip_ssl=skip_ssl
-                )
-            except JiraApiError as exc:
-                st.error(str(exc))
-            else:
-                st.session_state["_jira_discovery"] = discovery
-                st.session_state["_jira_connect_params"] = {
-                    "base_url": base_url.strip(),
-                    "token": token,
-                    "project_key": project_key.strip(),
-                    "months_back": int(months_back),
-                    "skip_ssl": skip_ssl,
-                }
-                # Yeni bir kesif, onceki onaylanmis tam veriyi GECERSIZ kilar -
-                # aksi halde eslestirme degissede eski CSV kullanilmaya devam ederdi.
-                st.session_state.pop("_jira_fetched_bytes", None)
-                st.session_state.pop("_jira_fetched_name", None)
-
-    discovery = st.session_state.get("_jira_discovery")
-    connect_params = st.session_state.get("_jira_connect_params")
-
-    if discovery is not None and connect_params is not None:
-        sample_issues = discovery["sample_issues"]
-        if not sample_issues:
-            st.warning(
-                f"'{connect_params['project_key']}' projesinde hiç kart bulunamadı "
-                "(sorgu 0 sonuç döndürdü). Proje anahtarını kontrol edin."
-            )
-
-        all_fields = discovery["all_fields"]
-        field_labels = {f["id"]: f"{f.get('name', f['id'])} ({f['id']})" for f in all_fields}
-        select_options = [JIRA_FIELD_NOT_SELECTED] + [f["id"] for f in all_fields]
-
-        st.caption("Alan eşleştirmesini kontrol edin (otomatik bulunamadıysa/yanlışsa elle seçin):")
-        field_id_map: dict[str, str | None] = {}
-        for target_key, target_label in JIRA_FIELD_MAP_LABELS.items():
-            candidates = discovery["candidates"].get(target_key, [])
-            default_id = candidates[0]["id"] if candidates else None
-            default_index = select_options.index(default_id) if default_id in select_options else 0
-            picked = st.selectbox(
-                target_label,
-                select_options,
-                index=default_index,
-                format_func=lambda opt: JIRA_FIELD_NOT_SELECTED if opt == JIRA_FIELD_NOT_SELECTED else field_labels.get(opt, opt),
-                key=f"jira_field_pick_{target_key}",
-            )
-            field_id_map[target_key] = None if picked == JIRA_FIELD_NOT_SELECTED else picked
-
-        if sample_issues:
-            st.caption(f"Örnek önizleme ({len(sample_issues)} kart):")
-            st.dataframe(_jira_sample_preview_df(sample_issues, field_id_map), width="stretch", hide_index=True)
-
-        # Bulunan alan ID'leri (`customfield_XXXXX`) her Jira kurulumunda farklidir
-        # ve elle bulunmasi zahmetlidir. Kesif onlari zaten cozdugu icin, sonucu
-        # `.env`'e yapistirilabilir halde sunmak keşif adimini KALICI olarak
-        # atlatir - bir dahaki acilista dogrudan veri cekilir.
-        with st.expander("💾 Bu ayarları kalıcı yap (.env)"):
-            st.caption(
-                "Aşağıdakini proje kökündeki `.env` dosyasına yapıştırın - bir dahaki "
-                "açılışta bu adım tamamen atlanır ve veri tek tıkla gelir."
-            )
-            st.code(
-                env_snippet(connect_params["base_url"], connect_params["project_key"], field_id_map),
-                language="bash",
-            )
-
-        if st.button("Onayla ve Tam Veriyi Çek", type="primary", key="jira_fetch_all_btn"):
+    if st.session_state.get("_jira_fetch_attempted") != signature:
+        st.session_state["_jira_fetch_attempted"] = signature
+        with st.spinner("Jira'dan veriler cekiliyor..."):
             try:
                 full_df = _call_jira_api_with_ssl_retry(
                     fetch_issues_from_jira_api,
-                    connect_params["base_url"],
-                    connect_params["token"],
-                    connect_params["project_key"],
-                    field_id_map,
-                    months_back=connect_params["months_back"],
-                    skip_ssl=connect_params["skip_ssl"],
+                    cfg.base_url,
+                    cfg.token,
+                    cfg.project_key,
+                    cfg.field_id_map,
+                    months_back=cfg.months_back,
+                    skip_ssl=cfg.skip_ssl,
                 )
             except JiraApiError as exc:
-                st.error(str(exc))
+                st.session_state["_jira_fetch_error"] = str(exc)
             else:
                 if full_df.empty:
-                    st.warning(
-                        f"Son {connect_params['months_back']} ay içinde hiç kart bulunamadı."
-                    )
+                    st.session_state["_jira_fetch_error"] = "Secilen donemde Jira karti bulunamadi."
                 else:
                     st.session_state["_jira_fetched_bytes"] = full_df.to_csv(index=False).encode("utf-8-sig")
-                    st.session_state["_jira_fetched_name"] = "jira_canli_veri.csv"
-                    st.success(f"{len(full_df):,} kart Jira'dan çekildi.")
+                    st.session_state["_jira_fetched_name"] = f"jira_{cfg.project_key.lower()}_canli_veri.csv"
+                    st.session_state["_jira_fetched_rows"] = len(full_df)
+                    st.session_state["_jira_ignored_person_fields"] = full_df.attrs.get(
+                        "ignored_text_person_fields", []
+                    )
 
-    fetched_bytes = st.session_state.get("_jira_fetched_bytes")
-    fetched_name = st.session_state.get("_jira_fetched_name")
-    return fetched_bytes, fetched_name
+    return (
+        st.session_state.get("_jira_fetched_bytes"),
+        st.session_state.get("_jira_fetched_name"),
+        st.session_state.get("_jira_fetch_error"),
+    )
 
 
 # --------------------------------------------------------------------------
-# Kenar cubugu - dosya yukleme, gezinme ve filtreler
+# .env baglantisi, gezinme ve filtreler
 # --------------------------------------------------------------------------
 
-file_bytes: bytes | None = None
-file_name: str | None = None
-
+cfg = load_jira_config()
 with st.sidebar:
     if LOGO_FULL_PATH.exists():
         st.image(str(LOGO_FULL_PATH), width=200)
     st.header("📊 Kontrol Paneli")
-    veri_kaynagi = st.radio(
-        "Veri Kaynağı", ["📁 Dosya Yükle", "🔗 Jira'ya Canlı Bağlan"], horizontal=True
-    )
+    with st.expander("⚙️ Jira Ayarları", expanded=False):
+        st.caption(f"Kaynak: `.env` · Proje: **{cfg.project_key or '—'}** · Kapsam: son {cfg.months_back} ay")
+        with st.form("jira_env_settings_form", clear_on_submit=True):
+            jira_url = st.text_input("Jira URL", value=cfg.base_url)
+            jira_project = st.text_input("Proje anahtarı", value=cfg.project_key)
+            jira_token = st.text_input(
+                "Yeni PAT (boş bırakılırsa mevcut korunur)", type="password", value=""
+            )
+            jira_months = st.number_input("Ay kapsamı", min_value=1, max_value=36, value=cfg.months_back)
+            story_field = st.text_input("Story Points alan ID", value=cfg.field_id_map.get("story_points") or "")
+            developer_field = st.text_input("Developer alan ID", value=cfg.field_id_map.get("developer") or "")
+            analyst_field = st.text_input("Analyst alan ID", value=cfg.field_id_map.get("analyst") or "")
+            sprint_field = st.text_input("Sprint alan ID (isteğe bağlı)", value=cfg.field_id_map.get("sprint") or "")
+            transition_field = st.text_input(
+                "Last Transition alan ID (isteğe bağlı)", value=cfg.field_id_map.get("last_transition") or ""
+            )
+            skip_ssl = st.checkbox("SSL doğrulamasını atla", value=cfg.skip_ssl)
+            sprint_fallback = st.checkbox("SprintDışı tarih yedeği", value=cfg.sprint_disi_fallback_enabled)
+            save_settings = st.form_submit_button("Ayarları kaydet")
+        settings_error = st.empty()
+        settings_warning = st.empty()
 
-    if veri_kaynagi == "📁 Dosya Yükle":
-        uploaded_file = st.file_uploader(
-            "Jira Raporu Yükle (HTML / CSV / XLSX)", type=["html", "htm", "csv", "xlsx"]
-        )
-        if uploaded_file is not None:
-            file_bytes = uploaded_file.getvalue()
-            file_name = uploaded_file.name
+if save_settings:
+    updates = {
+        "JIRA_BASE_URL": jira_url,
+        "JIRA_PROJECT_KEY": jira_project,
+        "JIRA_MONTHS_BACK": str(jira_months),
+        "JIRA_FIELD_STORY_POINTS": story_field,
+        "JIRA_FIELD_DEVELOPER": developer_field,
+        "JIRA_FIELD_ANALYST": analyst_field,
+        "JIRA_FIELD_SPRINT": sprint_field,
+        "JIRA_FIELD_LAST_TRANSITION": transition_field,
+        "JIRA_SKIP_SSL": str(skip_ssl).lower(),
+        "SPRINT_DISI_FALLBACK_ENABLED": str(sprint_fallback).lower(),
+    }
+    if jira_token:
+        updates["JIRA_PAT"] = jira_token
+    try:
+        if not (jira_token or cfg.token):
+            raise ValueError("Jira PAT gerekli.")
+        save_jira_settings(updates)
+    except (ValueError, OSError) as exc:
+        settings_error.error(str(exc))
     else:
-        file_bytes, file_name = _render_jira_live_connect_ui()
+        st.session_state.pop("_jira_source_signature", None)
+        st.rerun()
 
-if file_bytes is None:
-    st.title("Türkcell Jira Sprint & KPI Paneli")
-    st.info(
-        "Başlamak için soldaki menüden bir Jira raporu (HTML, CSV veya XLSX) yükleyin ya da "
-        "Jira'ya canlı bağlanın."
-    )
+file_bytes, file_name, jira_error = _fetch_env_jira_data(cfg)
+ignored_fields = st.session_state.get("_jira_ignored_person_fields", [])
+if ignored_fields:
+    settings_warning.warning("Düz metin döndüren kişi alanları ekip hesabına alınmadı: " + ", ".join(ignored_fields))
+if jira_error:
+    st.error(jira_error)
+    st.stop()
+if file_bytes is None or file_name is None:
+    st.error("Jira verisi alınamadı. `.env` bağlantı ayarlarını kontrol edin.")
     st.stop()
 
 # .streamlit/config.toml'daki [server] maxUploadSize (50 MB) ile tutarli bir ust
@@ -1378,7 +1261,7 @@ if file_bytes is None:
 MAX_UPLOAD_SIZE_BYTES = 52428800  # 50 MB
 if len(file_bytes) > MAX_UPLOAD_SIZE_BYTES:
     boyut_mb = len(file_bytes) / (1024 * 1024)
-    st.error(f"Dosya çok büyük ({boyut_mb:.1f} MB). Lütfen 50MB altında bir rapor kullanın.")
+    st.error(f"Jira verisi çok büyük ({boyut_mb:.1f} MB); 50 MB sınırı aşıldı.")
     st.stop()
 
 try:
@@ -1434,9 +1317,10 @@ with st.sidebar:
     # "Kişi" filtresi, sadece atanan (assignee) değil, kartların Developer/Analist
     # alanlarında geçen herkesi de kapsar - bkz. `standardize_dataframe`'in
     # "developers"/"analysts" (coklu-degerli, liste) kolonlari.
-    person_pool = {a for a in df["assignee"].astype(str).str.strip() if a}
+    team_scope = filter_by_month(df, selected_month) if selected_month else df
+    person_pool = {a for a in team_scope["assignee"].astype(str).str.strip() if a}
     for role_column in ("developers", "analysts"):
-        for values in df[role_column]:
+        for values in team_scope[role_column]:
             person_pool.update(str(v).strip() for v in values if str(v).strip())
     assignee_options = ["Tüm Ekip"] + sorted(person_pool)
     selected_assignee_label = st.selectbox("Kişi", assignee_options, index=0)
@@ -1471,7 +1355,7 @@ kpis = calculate_sprint_kpis(kpi_df)
 
 st.title("Türkcell Jira Sprint & KPI Paneli")
 st.caption(
-    "Jira raporunuzu (HTML, CSV veya XLSX) yükleyin; KPI'lar, drill-down analizler ve akıllı sohbet asistanı "
+    "Jira verisi .env bağlantısıyla otomatik çekilir; KPI'lar, drill-down analizler ve akıllı sohbet asistanı "
     "soldaki menüden erişilebilir sayfalar halinde hazırlanır."
 )
 
@@ -1479,7 +1363,11 @@ hero_cols = st.columns(4)
 with hero_cols[0]:
     _tile("Toplam Kart", f"{len(df):,}")
 with hero_cols[1]:
-    _tile("Ekip Büyüklüğü", str(len(assignee_options) - 1))
+    _tile(
+        "Kartlarda Görülen Kişi",
+        str(len(assignee_options) - 1),
+        help_text="Seçili sprintteki Assignee, Developer ve Analyst alanlarında adı geçen tekil kişilerdir; ekip kadrosundaki kartı olmayan kişiler dahil değildir.",
+    )
 with hero_cols[2]:
     _tile("Ay Sayısı", str(len(all_months)))
 with hero_cols[3]:
@@ -2186,7 +2074,7 @@ elif page == PAGE_AKIS:
 
     _section(
         "WIP Aging",
-        "Henüz tamamlanmamış işlerin hangi aydan kaldığı (3 birbirini dışlayan kova)",
+        "Seçili sprintteki aktif işlerin yaşı (bütün aktif kartlar 3 kovadan birine girer)",
         help_text=KPI_HELP["wip_aging_genel"],
     )
     w1, w2 = st.columns(2)
@@ -2195,7 +2083,7 @@ elif page == PAGE_AKIS:
     with w2:
         _tile("Ortalama Yaş (gün)", f"{wip['ortalama_yas_gun']:.1f}")
 
-    # Bu 3 kova (Bir Önceki Aydan Gelen/3 Aylık/6 Aylık) BİRBİRİYLE EŞLİ ("radio"
+    # Bu 3 kova (0-1/2-5/6+ aylık) BİRBİRİYLE EŞLİ ("radio"
     # benzeri) çalışır: biri açılınca diğer ikisi otomatik kapanır. Bunu, widget
     # render edilmeden ÖNCE (bir sonraki rerun'u beklemeden, aynı anda) uygulamak
     # için `st.toggle`'ın `on_change` callback'i kullanılır - Streamlit, bir
@@ -2203,7 +2091,7 @@ elif page == PAGE_AKIS:
     # HEMEN SONRA ama asıl script gövdesi (bu döngü) TEKRAR ÇALIŞMADAN ÖNCE
     # tetikler; bu yüzden döngüdeki diğer `st.toggle(...)` çağrıları, kapatılmış
     # session_state'i AYNI çalıştırmada doğru okur - ekstra bir tıklama/rerun
-    # gerekmez. İlk kova ("Bir Önceki Aydan Gelen" - son 1 ay) sayfa ilk
+    # gerekmez. İlk kova ("0-1 Aylık Aktif İş") sayfa ilk
     # açıldığında varsayılan olarak AÇIK gelir, diğer ikisi kapalı başlar.
     wip_bucket_keys = ("onceki_ay", "uc_aylik", "alti_aylik")
     wip_state_key = {k: f"open_wip_{k}" for k in wip_bucket_keys}
@@ -2264,7 +2152,7 @@ elif page == PAGE_AKIS:
             key="wip_bucket_chart",
         )
         st.caption(
-            "🟡 Bir önceki aydan gelen · 🟠 3 aylık olan · 🔴 6 aylık/uzun süreli — "
+            "🟡 0-1 aylık · 🟠 2-5 aylık · 🔴 6+ aylık — "
             "bir sütuna tıklayarak o grubun detayını açabilirsiniz."
         )
 
@@ -2349,13 +2237,13 @@ elif page == PAGE_AKIS:
 
     _section(
         "Yoğunlaşma ve Geri Dönüş",
-        "El değiştirme eğilimi (proxy) ve reopen oranı",
+        "İş yükü yoğunlaşması ve geri dönüş/test göstergesi",
         help_text=KPI_HELP["yogunlasma_reopen_genel"],
     )
     bc_col, r_col = st.columns(2)
     with bc_col, st.container(border=True):
         bounce_tier = _status_tier(bouncing["yogunlasma_orani_yuzde"], good_cut=30, warn_cut=45, higher_is_better=False)
-        st.markdown(f"**Assignee Bouncing (Proxy)**{_info_icon(KPI_HELP['bouncing'])}", unsafe_allow_html=True)
+        st.markdown(f"**İş Yükü Yoğunlaşması (Proxy)**{_info_icon(KPI_HELP['bouncing'])}", unsafe_allow_html=True)
         st.markdown(
             f"<div style='font-size:1.6rem;font-weight:800;color:{STATUS[bounce_tier]};'>"
             f"%{bouncing['yogunlasma_orani_yuzde']:.1f}</div>",
@@ -2365,7 +2253,8 @@ elif page == PAGE_AKIS:
         st.caption(bouncing["not"])
     with r_col, st.container(border=True):
         reopen_tier = _status_tier(reopen["reopen_orani_yuzde"], good_cut=5, warn_cut=15, higher_is_better=False)
-        st.markdown(f"**Reopen / Geri Dönüş**{_info_icon(KPI_HELP['reopen'])}", unsafe_allow_html=True)
+        reopen_label = "Testte Bekleyen (Proxy)" if reopen["yontem"] == "test_asamasinda_takilma" else "Reopen / Geri Dönüş"
+        st.markdown(f"**{reopen_label}**{_info_icon(KPI_HELP['reopen'])}", unsafe_allow_html=True)
         st.markdown(
             f"<div style='font-size:1.6rem;font-weight:800;color:{STATUS[reopen_tier]};'>"
             f"%{reopen['reopen_orani_yuzde']:.1f}</div>",
@@ -2381,8 +2270,8 @@ elif page == PAGE_AKIS:
         st.markdown(
             f"""
 - **WIP Aging:** {wip['aktif_is_sayisi']} aktif işin ortalama açık kalma süresi
-  **{wip['ortalama_yas_gun']:.1f} gün**; **{wip['onceki_ay']['is_sayisi']}** tanesi bir önceki aydan kalma,
-  **{wip['uc_aylik']['is_sayisi']}** tanesi 2-3 aylık, **{wip['alti_aylik']['is_sayisi']}** tanesi
+  **{wip['ortalama_yas_gun']:.1f} gün**; **{wip['onceki_ay']['is_sayisi']}** tanesi 0-1 aylık,
+  **{wip['uc_aylik']['is_sayisi']}** tanesi 2-5 aylık, **{wip['alti_aylik']['is_sayisi']}** tanesi
   6+ aydır açık (uzun süreli).
 - **Blocker & Hold:** İşlerin **%{blocker['tikali_is_orani_yuzde']:.1f}**'i tıkanmış durumda,
   bu da **{blocker['tikali_sp']:.0f} SP**'lik bir kapasite kaybına denk geliyor.
@@ -2498,7 +2387,8 @@ elif page == PAGE_AKIS:
                         ShareBullet(
                             f"WIP Aging: {wip['aktif_is_sayisi']} aktif işin ortalama açık kalma süresi "
                             f"{wip['ortalama_yas_gun']:.1f} gün; {wip['onceki_ay']['is_sayisi']} tanesi "
-                            f"önceki aydan, {wip['alti_aylik']['is_sayisi']} tanesi 6+ aydır açık."
+                            f"0-1 aylık, {wip['uc_aylik']['is_sayisi']} tanesi 2-5 aylık, "
+                            f"{wip['alti_aylik']['is_sayisi']} tanesi 6+ aylık."
                         ),
                         ShareBullet(
                             f"Blocker & Hold: işlerin %{blocker['tikali_is_orani_yuzde']:.1f} kadarı tıkanmış, "
