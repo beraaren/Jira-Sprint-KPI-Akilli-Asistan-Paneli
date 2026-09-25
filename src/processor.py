@@ -2534,11 +2534,13 @@ def calculate_capacity_forecast_split(
     df: pd.DataFrame,
     target_month: str | None = None,
     lookback_months: int = CAPACITY_FORECAST_DEFAULT_LOOKBACK_MONTHS,
+    require_sprint_membership: bool = False,
 ) -> dict:
     """`calculate_capacity_forecast`'i planlanan (Sprint) ve plan dışı (Sprint Dışı)
-    işler için AYRI AYRI çalıştırıp iki bağımsız tahmini bir arada döner - "Sprint"
-    burada da (tüm panoda olduğu gibi) `created` tarihine göre TAKVİM AYI anlamına
-    gelir, ham veride ayrı bir Jira "Sprint" alanı bulunsa bile o kullanılmaz.
+    işler için AYRI AYRI çalıştırıp iki bağımsız tahmini bir arada döner.
+    Aylık gruplama Sprint alanını, çözülemezse Created tarihini kullanır.
+    `require_sprint_membership=True` olduğunda planlanan tahmini yalnızca gerçek
+    sprint üyeliği olan ve iptal edilmemiş kartlardan hesaplanır.
 
     Taahhüt edilen ve plan dışı iş genellikle çok farklı büyüklük/dinamiklere sahip
     olduğundan (plan dışı işler taahhüt edilmemiş, sprint ortasında eklenen işlerdir),
@@ -2568,13 +2570,26 @@ def calculate_capacity_forecast_split(
     Her iki alt sonuç da `calculate_capacity_forecast` ile AYNI şema/alanlara sahiptir
     (bkz. o fonksiyonun docstring'i).
     """
+    planned_source = df
+    if require_sprint_membership:
+        # The Created-date fallback used by other monthly reports must not turn
+        # sprintless cards into committed sprint work. Cancelled cards also do
+        # not contribute to the commitment shown on the Jira board.
+        if "sprint_months" in df.columns:
+            planned_source = df.loc[df["sprint_months"].map(bool)]
+        else:
+            planned_source = df.iloc[0:0]
+        planned_source = planned_source.loc[
+            ~_matches_any_keyword(planned_source["status"], CANCELLED_STATUS_KEYWORDS)
+        ]
+
     out_of_plan_pairs = _monthly_out_of_plan_completed(
         df, last_n_months=lookback_months + 1, end_month=target_month
     )
 
     return {
         "planned_forecast": calculate_capacity_forecast(
-            df, target_month=target_month, lookback_months=lookback_months
+            planned_source, target_month=target_month, lookback_months=lookback_months
         ),
         "out_of_plan_forecast": _build_capacity_forecast(
             out_of_plan_pairs, latest_month_label(df)

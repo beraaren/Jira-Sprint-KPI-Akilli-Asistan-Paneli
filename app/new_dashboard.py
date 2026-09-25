@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import importlib
+import inspect
 import sys
 import tempfile
 from hashlib import sha256
@@ -39,8 +40,13 @@ if not hasattr(jira_config_module, "save_jira_settings"):
 
 # Keep the corrected WIP calculation active in an already open Streamlit process.
 import processor as jira_processor_module  # noqa: E402
-if getattr(jira_processor_module, "WIP_BUCKET_LABELS", None) != (
-    "0-1 Aylık Aktif İş", "2-5 Aylık Aktif İş", "6+ Aylık Aktif İş"
+if (
+    getattr(jira_processor_module, "WIP_BUCKET_LABELS", None) != (
+        "0-1 Aylık Aktif İş", "2-5 Aylık Aktif İş", "6+ Aylık Aktif İş"
+    )
+    or "require_sprint_membership" not in inspect.signature(
+        jira_processor_module.calculate_capacity_forecast_split
+    ).parameters
 ):
     importlib.reload(jira_processor_module)
 
@@ -1398,9 +1404,11 @@ if page == PAGE_GENEL:
                 "Ortalama Pencere (ay)", [1, 2, 3, 4, 5, 6], index=2, key="capacity_lookback"
             )
         split_forecast = calculate_capacity_forecast_split(
-            df_scope, target_month=selected_month, lookback_months=lookback_months
+            df_scope, target_month=selected_month, lookback_months=lookback_months,
+            require_sprint_membership=True,
         )
         st.markdown("**Sprint (Planlanan) Tahmini**", unsafe_allow_html=True)
+        st.caption("Taahhüt: seçili sprintteki, iptal edilmemiş planlanan kartların SP toplamı.")
         _render_capacity_forecast_group(split_forecast["planned_forecast"])
         st.write("")
         st.markdown("**Sprint Dışı Tahmini**", unsafe_allow_html=True)

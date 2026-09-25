@@ -27,6 +27,7 @@ from processor import (  # noqa: E402
     build_month_sprint_labels,
     build_planned_issues_table,
     build_sprint_period_map,
+    calculate_capacity_forecast_split,
     calculate_assignee_metrics,
     calculate_sprint_kpis,
     drop_duplicate_rows,
@@ -66,6 +67,18 @@ def _frame(rows: list[dict]) -> pd.DataFrame:
 
 
 class SprintBasedMonthFilterTests(unittest.TestCase):
+    def test_capacity_commitment_uses_sprint_membership_and_excludes_cancelled(self):
+        df = _frame([
+            _raw_row("Sprint work", "03-Mar-26 03:02", ["Eylül İterasyonu - 2026"], sp=194),
+            _raw_row("Created this month", "01-Sep-26 10:00", [], sp=19),
+            _raw_row("Cancelled", "01-Sep-26 10:00", ["Eylül İterasyonu - 2026"],
+                     sp=3, status="İptal"),
+        ])
+        forecast = calculate_capacity_forecast_split(
+            df, target_month="Eylül 2026", require_sprint_membership=True
+        )["planned_forecast"]
+        self.assertEqual(forecast["bu_ay_taahhut_sp"], 194)
+
     def test_devreden_kart_acildigi_ayda_degil_sprint_ayinda_sayilir(self):
         """Mart'ta acilip Temmuz sprintine devretmis kart Temmuz raporuna GIRMELI
         (eski `created` davranisinda kayboluyordu)."""
